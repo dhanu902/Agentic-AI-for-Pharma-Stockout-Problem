@@ -1,0 +1,37 @@
+# Ignore dataset files
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.json
+
+# Ignore data folders
+data/
+datasets/
+raw_data/
+
+# Ignore model files
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+
+# Ignore logs
+*.log
+
+# Ignore environment files
+.env
+venv/
+.env/
+ENV/
+
+# Mac system files
+.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
