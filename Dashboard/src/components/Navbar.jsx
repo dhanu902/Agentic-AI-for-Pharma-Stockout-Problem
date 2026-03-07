@@ -1,55 +1,63 @@
-import { NavLink } from "react-router-dom";
+import { NavLink, useLocation } from "react-router-dom";
+
+const T = {
+  bg:     "#080c12",
+  border: "#1e2a3a",
+  muted:  "#4a6080",
+  blue:   "#3b82f6",
+  orange: "#f97316",
+};
 
 function Navbar() {
-  const linkStyle = ({ isActive }) => ({
-    color: isActive ? "#388bfd" : "#c9d1d9",
-    textDecoration: "none",
-    fontWeight: 600,
-    fontSize: 14,
-    padding: "8px 14px",
-    borderRadius: 8,
-    background: isActive ? "#388bfd15" : "transparent",
-    border: isActive ? "1px solid #388bfd33" : "1px solid transparent",
-    transition: "all 0.2s ease"
+  const location  = useLocation();
+  const currentSku = new URLSearchParams(location.search).get("sku") || "";
+  const withSku   = (path) => currentSku ? `${path}?sku=${currentSku}` : path;
+
+  const base = {
+    textDecoration: "none", fontWeight: 700, fontSize: 13,
+    padding: "7px 14px", borderRadius: 8,
+    transition: "all 0.15s ease", letterSpacing: 0.2,
+    fontFamily: "'IBM Plex Sans', sans-serif",
+  };
+
+  const blueStyle = ({ isActive }) => ({
+    ...base,
+    color:      isActive ? T.blue   : T.muted,
+    background: isActive ? T.blue   + "15" : "transparent",
+    border:    `1px solid ${isActive ? T.blue   + "33" : "transparent"}`,
+  });
+
+  const orangeStyle = ({ isActive }) => ({
+    ...base,
+    color:      isActive ? T.orange : T.muted,
+    background: isActive ? T.orange + "15" : "transparent",
+    border:    `1px solid ${isActive ? T.orange + "33" : "transparent"}`,
   });
 
   return (
-    <nav
-      style={{
-        background: "#0d1117",
-        borderBottom: "1px solid #21262d",
-        padding: "14px 28px",
-        display: "flex",
-        alignItems: "center",
-        gap: 16
-      }}
-    >
+    <nav style={{
+      background: T.bg, borderBottom: `1px solid ${T.border}`,
+      padding: "12px 28px", display: "flex", alignItems: "center", gap: 4,
+    }}>
+      {/* Brand */}
       <div style={{
-        fontSize: 11,
-        letterSpacing: 3,
-        color: "#6e7681",
-        textTransform: "uppercase",
-        marginRight: 20
+        display: "flex", alignItems: "center", gap: 8,
+        marginRight: 20, paddingRight: 20, borderRight: `1px solid ${T.border}`,
       }}>
-        ◈ SKU Intelligence
+        <div style={{
+          width: 22, height: 22,
+          background: `linear-gradient(135deg, ${T.blue}, #2dd4bf)`,
+          borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12,
+        }}>◈</div>
+        <span style={{ fontSize: 10, letterSpacing: 3, color: T.muted, textTransform: "uppercase", fontWeight: 700, fontFamily: "'IBM Plex Sans', sans-serif" }}>
+          SKU Intelligence
+        </span>
       </div>
 
-      <NavLink to="/" style={linkStyle}>
-        Forecast
-      </NavLink>
-
-      <NavLink to="/inventory" style={linkStyle}>
-        Inventory
-      </NavLink>
-
-      <NavLink to="/recommendation" style={linkStyle}>
-        Recommendation
-      </NavLink>
-
-      <NavLink to="/admin" style={linkStyle}>
-        Admin
-      </NavLink>
-
+      <NavLink to={withSku("/")}                style={blueStyle}>Forecast</NavLink>
+      <NavLink to={withSku("/inventory")}       style={blueStyle}>Inventory</NavLink>
+      <NavLink to={withSku("/recommendation")}  style={blueStyle}>Recommendation</NavLink>
+      <NavLink to="/admin"                      style={blueStyle}>Admin</NavLink>
     </nav>
   );
 }

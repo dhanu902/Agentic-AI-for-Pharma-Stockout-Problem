@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
-/* ─── Tokens ─────────────────────────────────────────────────── */
+const API_BASE = "http://127.0.0.1:5000/api/forecast";
+
+/* ─── Const for UI ─────────────────────────────────────────────────── */
 const T = {
   bg:       "#080c12",
   surface:  "#0e1420",
@@ -18,13 +20,13 @@ const T = {
   teal:     "#2dd4bf",
 };
 
-const API_BASE = "http://127.0.0.1:5000";
-
 function pretty(obj) {
   try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
 }
 
-/* ─── Badge ──────────────────────────────────────────────────── */
+
+
+/* ─── Badge ─── */
 const Badge = ({ label, color }) => (
   <span style={{
     background: color + "22",
@@ -39,7 +41,7 @@ const Badge = ({ label, color }) => (
   }}>{label}</span>
 );
 
-/* ─── Button ─────────────────────────────────────────────────── */
+/* ─── Button ─── */
 const Button = ({ children, onClick, disabled, variant = "primary", fullWidth }) => {
   const styles = {
     primary: { background: T.blue,    color: "#fff" },
@@ -78,7 +80,7 @@ const Button = ({ children, onClick, disabled, variant = "primary", fullWidth })
   );
 };
 
-/* ─── Panel ──────────────────────────────────────────────────── */
+/* ─── Panel ─── */
 const Panel = ({ title, subtitle, right, children, accent }) => (
   <div style={{
     background: T.card,
@@ -100,7 +102,7 @@ const Panel = ({ title, subtitle, right, children, accent }) => (
   </div>
 );
 
-/* ─── Health Stat ────────────────────────────────────────────── */
+/* ─── Health Stat ─── */
 const HealthStat = ({ label, value, color }) => (
   <div style={{
     display: "flex", flexDirection: "column", gap: 4,
@@ -116,7 +118,7 @@ const HealthStat = ({ label, value, color }) => (
   </div>
 );
 
-/* ─── Op Group ───────────────────────────────────────────────── */
+/* ─── Op Group ─── */
 const OpGroup = ({ label, children }) => (
   <div style={{ marginBottom: 16 }}>
     <div style={{
@@ -134,7 +136,7 @@ const OpGroup = ({ label, children }) => (
   </div>
 );
 
-/* ─── Toast ──────────────────────────────────────────────────── */
+/* ─── Toast ─── */
 const Toast = ({ alert, onClose }) => {
   const [visible, setVisible] = useState(false);
 
@@ -198,6 +200,8 @@ const Toast = ({ alert, onClose }) => {
   );
 };
 
+
+
 /* ─── Main ───────────────────────────────────────────────────── */
 export default function Admin() {
   const [health, setHealth]   = useState(null);
@@ -216,46 +220,63 @@ export default function Admin() {
   };
 
   const call = async (key, path, options = {}) => {
+    const silent = options?.silent || false;
+  
     setBusyKey(key);
     setAlert(null);
+  
     try {
-      const res  = await fetch(`${API_BASE}${path}`, {
-        headers: { "Content-Type": "application/json" },
-        ...options,
+      const hasBody = options?.body !== undefined;
+      const method = (options?.method || "GET").toUpperCase();
+  
+      const res = await fetch(`${API_BASE}${path}`, {
+        method,
+        ...(hasBody ? { body: options.body } : {}),
+        headers: {
+          ...(hasBody ? { "Content-Type": "application/json" } : {}),
+          ...(options.headers || {}),
+        },
       });
+  
       const data = await res.json().catch(() => ({}));
-
+  
       if (res.status === 429) {
         const days = data?.days_remaining ?? "?";
         const last = data?.last_trained || data?.last_retuned || "";
         const msg  = `${data?.error || "Action blocked"} — ${data?.cooldown || "cooldown"}. Try again in ${days} day(s).${last ? ` Last: ${last}` : ""}`;
         setAlert({ type: "info", msg });
-        appendLog(`${key} ⏳ (${res.status})`, data);
+        if (!silent) appendLog(`${key} ⏳ (${res.status})`, data);
         return { ok: false, status: res.status, data };
       }
-
+  
       if (!res.ok) {
         setAlert({ type: "error", msg: data?.error || `${key} failed (${res.status})` });
-        appendLog(`${key} ❌ (${res.status})`, data);
+        if (!silent) appendLog(`${key} ❌ (${res.status})`, data);
         return { ok: false, status: res.status, data };
       }
-
+  
       setAlert({ type: "success", msg: data?.message || `${key} completed successfully` });
-      appendLog(`${key} ✅`, data);
+  
+      if (!silent) appendLog(`${key} ✅`, data);
+  
       return { ok: true, status: res.status, data };
-
+  
     } catch (e) {
       const err = { error: String(e) };
+  
       setAlert({ type: "error", msg: "Network error: backend not reachable." });
-      appendLog(`${key} ❌ (network)`, err);
+  
+      if (!silent) appendLog(`${key} ❌ (network)`, err);
+  
       return { ok: false, status: 0, data: err };
+  
     } finally {
       setBusyKey(null);
     }
   };
 
   const refreshHealth = async () => {
-    const out = await call("Health Check", "/health", { method: "GET" });
+    const out = await call("Health Check", "/health", { method: "GET", silent: true });
     if (out.ok) setHealth(out.data);
   };
 
@@ -268,6 +289,9 @@ export default function Admin() {
   }, [alert]);
 
   const isBusy = !!busyKey;
+  const hasData = (health?.rows ?? 0) > 0;
+  const canRetrain = hasData;                 // need processed data
+  const canRetune  = hasData && !!health?.model_loaded;  // need model + data
 
   return (
     <div style={{
@@ -400,8 +424,17 @@ export default function Admin() {
               }}>
                 ▶ Process Raw
               </Button>
+              
+              <Button variant="primary"
+                      disabled={isBusy}
+                      onClick={async () => {
+                await call("Generate Forecast File", "/export", {method: "POST", body: JSON.stringify({}),});
+              }}>
+                ⬇ Generate Forecast File
+              </Button>
+              
               <Button variant="ghost" disabled={isBusy} onClick={async () => {
-                await call("Reload Data", "/reload_data", { method: "POST", body: JSON.stringify({}) });
+                await call("Reload Data", "/reload_data", { method: "POST" });
                 await refreshHealth();
               }}>
                 ↺ Reload Data
@@ -424,13 +457,19 @@ export default function Admin() {
             right={<Badge label="Cooldown Protected" color={T.amber} />}
           >
             <OpGroup label="Scheduled">
-              <Button variant="primary" disabled={isBusy} onClick={async () => {
+              <Button variant="primary" 
+                      disabled={isBusy || !canRetrain} 
+                      title={!canRetrain ? "Run Process Raw first" : ""} 
+                      onClick={async () => {
                 await call("Retrain (weekly)", "/refresh_model", { method: "POST", body: JSON.stringify({}) });
                 await refreshHealth();
               }}>
                 ⟳ Retrain Weekly
               </Button>
-              <Button variant="amber" disabled={isBusy} onClick={async () => {
+              <Button variant="amber" 
+                      disabled={isBusy || !canRetune} 
+                      title={!canRetune ? "Need data + trained model" : ""}
+                      onClick={async () => {
                 await call("Retune (monthly)", "/retune_model", { method: "POST", body: JSON.stringify({}) });
                 await refreshHealth();
               }}>
@@ -439,7 +478,7 @@ export default function Admin() {
             </OpGroup>
             <OpGroup label="Utility">
               <Button variant="ghost" disabled={isBusy} onClick={async () => {
-                await call("Reload Model", "/reload_model", { method: "POST", body: JSON.stringify({}) });
+                await call("Reload Model", "/reload_model", { method: "POST" });
                 await refreshHealth();
               }}>
                 ↺ Reload Model
@@ -449,8 +488,8 @@ export default function Admin() {
               fontSize: 11, color: T.muted, lineHeight: 1.6,
               background: T.surface, borderRadius: 8, padding: "8px 12px",
             }}>
-              💡 For live demos: <span style={{ color: T.text, fontWeight: 700 }}>Process Raw → Reload Data</span> only.
-              Retrain / Retune are optional and cooldown-protected.
+              💡 For live demos: <span style={{ color: T.text, fontWeight: 700 }}>Process Raw</span> only.
+              Reload Data is only needed if <code>processed_data.csv</code> was manually replaced.
             </div>
           </Panel>
         </div>

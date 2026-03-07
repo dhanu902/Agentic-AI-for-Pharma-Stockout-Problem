@@ -1,10 +1,16 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ComposedChart, Line, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   Legend, ResponsiveContainer, Area, ReferenceLine
 } from "recharts";
 
-const API_BASE = "http://127.0.0.1:5000";
+const API_BASE = "http://127.0.0.1:5000/api/forecast";
+
+let forecastMemory = {
+  itemCode: "",
+  result: null,
+};
 
 /* ─── Tokens ─────────────────────────────────────────────────── */
 const T = {
@@ -35,17 +41,24 @@ function fmtK(n) {
   if (Math.abs(n) >= 1000) return (n / 1000).toFixed(1).replace(/\.0$/, "") + "k";
   return n.toString();
 }
+function abcColor(cat) {
+  return { A: T.green, B: T.amber, C: T.muted }[cat] ?? T.muted;
+}
+function demandStatusColor(status) {
+  if (!status) return T.muted;
+  const s = status.toLowerCase();
+  if (s.includes("inactive") || s.includes("near-zero")) return T.red;
+  if (s.includes("low")) return T.amber;
+  return T.green;
+}
 
 /* ─── Tooltip ────────────────────────────────────────────────── */
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
     <div style={{
-      background: "#0e1420",
-      border: `1px solid ${T.borderHi}`,
-      borderRadius: 8,
-      padding: "10px 14px",
-      fontSize: 12,
+      background: "#0e1420", border: `1px solid ${T.borderHi}`,
+      borderRadius: 8, padding: "10px 14px", fontSize: 12,
       boxShadow: "0 12px 40px rgba(0,0,0,0.7)",
     }}>
       <p style={{ color: T.muted, marginBottom: 6, fontWeight: 700, fontSize: 11, textTransform: "uppercase", letterSpacing: 1 }}>{label}</p>
@@ -64,88 +77,36 @@ const CustomTooltip = ({ active, payload, label }) => {
 /* ─── KPI Card ───────────────────────────────────────────────── */
 const KPICard = ({ label, value, sub, accent, icon }) => (
   <div style={{
-    background: T.card,
-    border: `1px solid ${T.border}`,
-    borderRadius: 10,
-    padding: "16px 18px",
-    flex: 1,
-    minWidth: 140,
-    position: "relative",
-    overflow: "hidden",
-    transition: "border-color 0.2s",
+    background: T.card, border: `1px solid ${T.border}`, borderRadius: 10,
+    padding: "16px 18px", flex: 1, minWidth: 140,
+    position: "relative", overflow: "hidden", transition: "border-color 0.2s",
   }}
     onMouseEnter={e => e.currentTarget.style.borderColor = accent + "66"}
     onMouseLeave={e => e.currentTarget.style.borderColor = T.border}
   >
-    {/* glow blob */}
-    <div style={{
-      position: "absolute", top: -20, right: -20,
-      width: 80, height: 80,
-      background: accent,
-      borderRadius: "50%",
-      opacity: 0.05,
-      filter: "blur(20px)",
-      pointerEvents: "none",
-    }} />
-
+    <div style={{ position: "absolute", top: -20, right: -20, width: 80, height: 80, background: accent, borderRadius: "50%", opacity: 0.05, filter: "blur(20px)", pointerEvents: "none" }} />
     <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
       {icon && <span style={{ fontSize: 13 }}>{icon}</span>}
-      <div style={{
-        fontSize: 10, color: T.muted,
-        textTransform: "uppercase", letterSpacing: 1.2, fontWeight: 700,
-      }}>{label}</div>
+      <div style={{ fontSize: 10, color: T.muted, textTransform: "uppercase", letterSpacing: 1.2, fontWeight: 700 }}>{label}</div>
     </div>
-
-    <div style={{
-      fontSize: 24, fontWeight: 800, color: T.text,
-      fontFamily: "'JetBrains Mono', monospace",
-      lineHeight: 1,
-      marginBottom: 6,
-    }}>{value}</div>
-
-    {sub && (
-      <div style={{
-        fontSize: 11, color: accent, fontWeight: 600,
-        display: "flex", alignItems: "center", gap: 4,
-      }}>{sub}</div>
-    )}
-
-    {/* bottom accent line */}
-    <div style={{
-      position: "absolute", bottom: 0, left: 0, right: 0,
-      height: 2, background: `linear-gradient(90deg, ${accent}, transparent)`,
-    }} />
+    <div style={{ fontSize: 24, fontWeight: 800, color: T.text, fontFamily: "'JetBrains Mono', monospace", lineHeight: 1, marginBottom: 6 }}>{value}</div>
+    {sub && <div style={{ fontSize: 11, color: accent, fontWeight: 600 }}>{sub}</div>}
+    <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 2, background: `linear-gradient(90deg, ${accent}, transparent)` }} />
   </div>
 );
 
-/* ─── Signal Card (compact) ──────────────────────────────────── */
+/* ─── Signal Card ────────────────────────────────────────────── */
 const SignalCard = ({ label, value, sub, accent }) => (
-  <div style={{
-    background: T.card,
-    border: `1px solid ${T.border}`,
-    borderLeft: `3px solid ${accent}`,
-    borderRadius: 8,
-    padding: "12px 16px",
-  }}>
-    <div style={{ fontSize: 10, color: T.muted, textTransform: "uppercase", letterSpacing: 1.2, fontWeight: 700, marginBottom: 6 }}>
-      {label}
-    </div>
-    <div style={{ fontSize: 18, fontWeight: 800, color: T.text, fontFamily: "'JetBrains Mono', monospace" }}>
-      {value}
-    </div>
+  <div style={{ background: T.card, border: `1px solid ${T.border}`, borderLeft: `3px solid ${accent}`, borderRadius: 8, padding: "12px 16px" }}>
+    <div style={{ fontSize: 10, color: T.muted, textTransform: "uppercase", letterSpacing: 1.2, fontWeight: 700, marginBottom: 6 }}>{label}</div>
+    <div style={{ fontSize: 18, fontWeight: 800, color: T.text, fontFamily: "'JetBrains Mono', monospace" }}>{value}</div>
     {sub && <div style={{ fontSize: 10, color: accent, marginTop: 3, fontWeight: 500 }}>{sub}</div>}
   </div>
 );
 
-/* ─── Chart Panel ────────────────────────────────────────────── */
+/* ─── Panel ──────────────────────────────────────────────────── */
 const Panel = ({ children, style = {} }) => (
-  <div style={{
-    background: T.card,
-    border: `1px solid ${T.border}`,
-    borderRadius: 12,
-    padding: "20px 22px 12px",
-    ...style,
-  }}>
+  <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 12, padding: "20px 22px 12px", ...style }}>
     {children}
   </div>
 );
@@ -170,58 +131,125 @@ const Divider = ({ label }) => (
 /* ─── Badge ──────────────────────────────────────────────────── */
 const Badge = ({ label, color }) => (
   <span style={{
-    background: color + "22",
-    border: `1px solid ${color}44`,
-    color: color,
-    borderRadius: 4,
-    padding: "2px 7px",
-    fontSize: 9,
-    fontWeight: 700,
-    textTransform: "uppercase",
-    letterSpacing: 1,
+    background: color + "22", border: `1px solid ${color}44`, color,
+    borderRadius: 4, padding: "2px 7px", fontSize: 9,
+    fontWeight: 700, textTransform: "uppercase", letterSpacing: 1,
   }}>{label}</span>
 );
 
+/* ─── SKU Info Strip ─────────────────────────────────────────── */
+const SkuInfoStrip = ({ result }) => {
+  if (!result || result.error) return null;
+
+  const abcCat = result.abc_category;
+  const abcCol = abcColor(abcCat);
+  const demStatus = result.demand_status;
+  const demCol = demandStatusColor(demStatus);
+
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+      padding: "7px 14px",
+      background: T.surface,
+      border: `1px solid ${T.borderHi}`,
+      borderRadius: 8,
+      marginBottom: 18,
+    }}>
+      {/* SKU Code */}
+      <span style={{ fontSize: 12, fontWeight: 800, color: T.text, fontFamily: "'JetBrains Mono', monospace", letterSpacing: 0.5 }}>
+        {result.item_code}
+      </span>
+
+      <span style={{ color: T.borderHi, fontSize: 14 }}>·</span>
+
+      {/* ABC Class */}
+      {abcCat && (
+        <span style={{
+          display: "inline-flex", alignItems: "center",
+          background: abcCol + "18", border: `1px solid ${abcCol}44`,
+          borderRadius: 5, padding: "2px 8px",
+          fontSize: 10, fontWeight: 800, color: abcCol,
+          textTransform: "uppercase", letterSpacing: 1,
+        }}>
+          ABC · {abcCat}
+        </span>
+      )}
+
+      {/* Demand Status */}
+      {demStatus && (
+        <span style={{
+          display: "inline-flex", alignItems: "center",
+          background: demCol + "18", border: `1px solid ${demCol}44`,
+          borderRadius: 5, padding: "2px 8px",
+          fontSize: 10, fontWeight: 700, color: demCol,
+        }}>
+          {demStatus}
+        </span>
+      )}
+
+      {/* As of — pushed to right */}
+      {result.as_of && (
+        <span style={{ marginLeft: "auto", fontSize: 10, color: T.muted }}>
+          As of <span style={{ color: T.text, fontWeight: 600 }}>{result.as_of}</span>
+        </span>
+      )}
+    </div>
+  );
+};
+
 /* ─── Main ───────────────────────────────────────────────────── */
 export default function Forecast() {
-  const [itemCode, setItemCode] = useState("");
-  const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [, setSearchParams] = useSearchParams();
+  const [itemCode, setItemCode] = useState(forecastMemory.itemCode || "");
+  const [result, setResult] = useState(forecastMemory.result || null);
+  const [loading, setLoading]   = useState(false);
 
-  const handleForecast = async () => {
+  const handleForecast = async (codeArg) => {
+    const raw = typeof codeArg === "string" ? codeArg : itemCode;
+    const code = String(raw || "").trim();
 
-    if (!itemCode.trim()) return;
+    if (!code) return;
+  
     setLoading(true);
-
     try {
-      const response = await fetch(`${API_BASE}`/dashboard, {
+      const response = await fetch(`${API_BASE}/dashboard`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ item_code: itemCode.trim() }),
+        body: JSON.stringify({ item_code: code }),
       });
-
+  
       const data = await response.json();
+  
       if (!response.ok) {
         setResult({ error: data?.error || "Failed to fetch dashboard" });
+        forecastMemory = { itemCode: code, result: { error: data?.error || "Failed to fetch dashboard" } };
         return;
       }
+  
       setResult(data);
-
+      setItemCode(code);
+  
+      forecastMemory = {
+        itemCode: code,
+        result: data,
+      };
+  
+      setSearchParams({ sku: code });
     } catch (error) {
       console.error("Error:", error);
-      setResult({ error: "Failed to fetch dashboard" });
-
+      const errObj = { error: "Failed to fetch dashboard" };
+      setResult(errObj);
+      forecastMemory = { itemCode: code, result: errObj };
     } finally {
       setLoading(false);
     }
-
   };
 
   const salesTrend     = useMemo(() => result?.sales_trend     || [], [result]);
   const inventoryTrend = useMemo(() => result?.inventory_trend || [], [result]);
   const shockTrend     = useMemo(() => result?.shock_trend     || [], [result]);
 
-  const mom = result?.mom_change;
+  const mom         = result?.mom_change;
   const momPositive = typeof mom === "number" ? mom > 0 : false;
 
   const forecastSplitLabel = useMemo(() => {
@@ -231,34 +259,20 @@ export default function Forecast() {
   }, [salesTrend]);
 
   return (
-    <div style={{
-      minHeight: "100vh",
-      background: T.bg,
-      fontFamily: "'IBM Plex Sans', sans-serif",
-      color: T.text,
-      padding: "28px 32px",
-    }}>
+    <div style={{ minHeight: "100vh", background: T.bg, fontFamily: "'IBM Plex Sans', sans-serif", color: T.text, padding: "28px 32px" }}>
       <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
 
       {/* ── Top Bar ── */}
       <div style={{
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "space-between",
-        marginBottom: 28,
-        paddingBottom: 20,
-        borderBottom: `1px solid ${T.border}`,
-        flexWrap: "wrap",
-        gap: 16,
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        marginBottom: 20, paddingBottom: 20, borderBottom: `1px solid ${T.border}`,
+        flexWrap: "wrap", gap: 16,
       }}>
-        {/* Brand */}
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           <div style={{
             width: 36, height: 36,
             background: `linear-gradient(135deg, ${T.blue}, ${T.teal})`,
-            borderRadius: 10,
-            display: "flex", alignItems: "center", justifyContent: "center",
-            fontSize: 18,
+            borderRadius: 10, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18,
           }}>◈</div>
           <div>
             <div style={{ fontSize: 9, color: T.blue, letterSpacing: 3, textTransform: "uppercase", fontWeight: 700, marginBottom: 2 }}>
@@ -271,26 +285,16 @@ export default function Forecast() {
           <div style={{ marginLeft: 8, display: "flex", gap: 6, flexWrap: "wrap" }}>
             <Badge label="XGBoost" color={T.blue} />
             <Badge label="Tweedie" color={T.teal} />
-            <Badge label="Optuna" color={T.purple} />
-            <Badge label="v1.0" color={T.muted} />
+            <Badge label="Optuna"  color={T.purple} />
+            <Badge label="v1.0"    color={T.muted} />
           </div>
         </div>
 
-        {/* Search area */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          {result?.as_of && (
-            <div style={{ fontSize: 11, color: T.muted, marginRight: 6 }}>
-              As of <span style={{ color: T.text, fontWeight: 600 }}>{result.as_of}</span>
-            </div>
-          )}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <div style={{
             display: "flex", alignItems: "center",
-            background: T.surface,
-            border: `1px solid ${T.borderHi}`,
-            borderRadius: 10,
-            padding: "9px 14px",
-            gap: 8,
-            width: 260,
+            background: T.surface, border: `1px solid ${T.borderHi}`,
+            borderRadius: 10, padding: "9px 14px", gap: 8, width: 260,
           }}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={T.muted} strokeWidth="2.5">
               <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
@@ -308,20 +312,14 @@ export default function Forecast() {
             />
           </div>
           <button
-            onClick={handleForecast}
+            onClick={() => handleForecast()}
             disabled={loading}
             style={{
               background: loading ? T.subtle : T.blue,
-              border: "none",
-              color: loading ? T.muted : "#fff",
-              fontWeight: 700,
-              fontSize: 13,
-              borderRadius: 10,
-              padding: "10px 20px",
-              cursor: loading ? "not-allowed" : "pointer",
-              transition: "background 0.2s",
-              fontFamily: "'IBM Plex Sans', sans-serif",
-              letterSpacing: 0.3,
+              border: "none", color: loading ? T.muted : "#fff",
+              fontWeight: 700, fontSize: 13, borderRadius: 10,
+              padding: "10px 20px", cursor: loading ? "not-allowed" : "pointer",
+              transition: "background 0.2s", fontFamily: "'IBM Plex Sans', sans-serif", letterSpacing: 0.3,
             }}
           >
             {loading ? "Loading…" : "Run Forecast"}
@@ -329,21 +327,21 @@ export default function Forecast() {
         </div>
       </div>
 
+      {/* ── SKU Info Strip ── */}
+      <SkuInfoStrip result={result} />
+
       {/* ── Error ── */}
       {result?.error && (
         <div style={{
           background: T.card, border: `1px solid ${T.red}44`,
-          borderLeft: `3px solid ${T.red}`,
-          borderRadius: 10, padding: "12px 16px",
-          color: T.red, marginBottom: 20, fontSize: 13,
+          borderLeft: `3px solid ${T.red}`, borderRadius: 10,
+          padding: "12px 16px", color: T.red, marginBottom: 20, fontSize: 13,
         }}>
           ⚠ {result.error}
         </div>
       )}
 
       {result && !result.error && (<>
-
-        {/* ── SECTION 1: Hero Layout — KPIs left, big chart right ── */}
         <style>{`
           .hero-grid { display: grid; grid-template-columns: minmax(220px, 300px) 1fr; gap: 16px; margin-bottom: 16px; }
           .kpi-stack { display: flex; flex-direction: column; gap: 10px; }
@@ -360,24 +358,12 @@ export default function Forecast() {
             .kpi-stack > * { min-width: 140px; }
           }
         `}</style>
-        <div className="hero-grid">
 
-          {/* Left: Primary KPI stack */}
+        {/* SECTION 1: Hero */}
+        <div className="hero-grid">
           <div className="kpi-stack">
-            <KPICard
-              label="Next Month Forecast"
-              value={fmt(result.next_month_forecast)}
-              sub={result.next_month_label}
-              accent={T.blue}
-              icon="📈"
-            />
-            <KPICard
-              label="Current Month Actual"
-              value={fmt(result.current_month_actual)}
-              sub={result.current_month_label}
-              accent={T.green}
-              icon="✓"
-            />
+            <KPICard label="Next Month Forecast"  value={fmt(result.next_month_forecast)}  sub={result.next_month_label}   accent={T.blue}   icon="📈" />
+            <KPICard label="Current Month Actual"  value={fmt(result.current_month_actual)} sub={result.current_month_label} accent={T.green}  icon="✓" />
             <KPICard
               label="MoM Change"
               value={`${momPositive ? "+" : ""}${fmt(result.mom_change)}%`}
@@ -385,24 +371,14 @@ export default function Forecast() {
               accent={momPositive ? T.green : T.red}
               icon={momPositive ? "↑" : "↓"}
             />
-            <KPICard
-              label="Avg Monthly Sales"
-              value={fmt(result.avg_monthly_sales)}
-              sub="Historical mean"
-              accent={T.purple}
-              icon="∅"
-            />
+            <KPICard label="Avg Monthly Sales" value={fmt(result.avg_monthly_sales)} sub="Historical mean" accent={T.purple} icon="∅" />
           </div>
 
-          {/* Right: Sales Trend (hero chart) */}
           <Panel>
             <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
-              <SectionHeader
-                title="Sales Trend — Actual vs Forecast"
-                subtitle="Past 12 months Clean_Demand + next-month forecast"
-              />
+              <SectionHeader title="Sales Trend — Actual vs Forecast" subtitle="Past 12 months Clean_Demand + next-month forecast" />
               <div style={{ display: "flex", gap: 6 }}>
-                <Badge label="Actual" color={T.green} />
+                <Badge label="Actual"   color={T.green} />
                 <Badge label="Forecast" color={T.blue} />
               </div>
             </div>
@@ -410,159 +386,73 @@ export default function Forecast() {
               <ComposedChart data={salesTrend} margin={{ top: 10, right: 16, bottom: 0, left: 0 }}>
                 <defs>
                   <linearGradient id="predGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={T.blue} stopOpacity={0.2} />
+                    <stop offset="0%"   stopColor={T.blue} stopOpacity={0.2} />
                     <stop offset="100%" stopColor={T.blue} stopOpacity={0} />
-                  </linearGradient>
-                  <linearGradient id="actGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor={T.green} stopOpacity={0.1} />
-                    <stop offset="100%" stopColor={T.green} stopOpacity={0} />
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fill: T.muted, fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}
-                  tickLine={false} axisLine={false} interval={2}
-                />
-                <YAxis
-                  tick={{ fill: T.muted, fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }}
-                  tickLine={false} axisLine={false} width={40}
-                  tickFormatter={fmtK}
-                />
+                <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }} tickLine={false} axisLine={false} interval={2} />
+                <YAxis tick={{ fill: T.muted, fontSize: 10, fontFamily: "'JetBrains Mono', monospace" }} tickLine={false} axisLine={false} width={40} tickFormatter={fmtK} />
                 <Tooltip content={<CustomTooltip />} />
                 {forecastSplitLabel && (
-                  <ReferenceLine
-                    x={forecastSplitLabel}
-                    stroke={T.blue}
-                    strokeDasharray="5 4"
-                    strokeOpacity={0.6}
-                    label={{
-                      value: "▶ Forecast",
-                      fill: T.blue,
-                      fontSize: 10,
-                      fontWeight: 700,
-                      position: "insideTopRight",
-                    }}
+                  <ReferenceLine x={forecastSplitLabel} stroke={T.blue} strokeDasharray="5 4" strokeOpacity={0.6}
+                    label={{ value: "▶ Forecast", fill: T.blue, fontSize: 10, fontWeight: 700, position: "insideTopRight" }}
                   />
                 )}
-                <Area
-                  dataKey="predicted"
-                  name="Predicted"
-                  fill="url(#predGrad)"
-                  stroke={T.blue}
-                  strokeWidth={2.5}
-                  strokeDasharray="7 4"
-                  dot={false}
-                  connectNulls={false}
-                />
-                <Line
-                  dataKey="actual"
-                  name="Actual"
-                  stroke={T.green}
-                  strokeWidth={2.5}
-                  dot={{ r: 3, fill: T.green, strokeWidth: 0 }}
-                  activeDot={{ r: 6, fill: T.green, stroke: T.bg, strokeWidth: 2 }}
-                  connectNulls={false}
-                />
+                <Area dataKey="predicted" name="Predicted" fill="url(#predGrad)" stroke={T.blue} strokeWidth={2.5} strokeDasharray="7 4" dot={false} connectNulls={false} />
+                <Line dataKey="actual" name="Actual" stroke={T.green} strokeWidth={2.5} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 6, fill: T.green, stroke: T.bg, strokeWidth: 2 }} connectNulls={false} />
               </ComposedChart>
             </ResponsiveContainer>
           </Panel>
         </div>
 
-        {/* ── SECTION 2: Last Month + Disruption Signals row ── */}
+        {/* SECTION 2: Signals */}
         <div className="signal-row">
-          <SignalCard
-            label="Last Month Actual"
-            value={fmt(result.last_month_actual)}
-            sub={result.last_month_label}
-            accent={T.teal}
-          />
-          <SignalCard
-            label="Bonus Qty (Cur / Last)"
-            value={`${fmt(result.bonus_qty_current_month)} / ${fmt(result.bonus_qty_last_month)}`}
-            sub={`Shock: ${result.bonus_shock_current_month} / ${result.bonus_shock_last_month}`}
-            accent={T.amber}
-          />
-          <SignalCard
-            label="Supply Shock (Cur / Last)"
-            value={`${fmt(result.supply_shock_current_month)} / ${fmt(result.supply_shock_last_month)}`}
-            sub="Recent stockout indicators"
-            accent={T.red}
-          />
+          <SignalCard label="Last Month Actual"         value={fmt(result.last_month_actual)} sub={result.last_month_label} accent={T.teal} />
+          <SignalCard label="Bonus Qty (Cur / Last)"    value={`${fmt(result.bonus_qty_current_month)} / ${fmt(result.bonus_qty_last_month)}`} sub={`Shock: ${result.bonus_shock_current_month} / ${result.bonus_shock_last_month}`} accent={T.amber} />
+          <SignalCard label="Supply Shock (Cur / Last)" value={`${fmt(result.supply_shock_current_month)} / ${fmt(result.supply_shock_last_month)}`} sub="Recent stockout indicators" accent={T.red} />
         </div>
 
-        {/* ── SECTION 3: Inventory + Shock charts ── */}
+        {/* SECTION 3: Charts */}
         <Divider label="Market Signals" />
         <div className="bottom-grid">
-
-          {/* Inventory */}
           <Panel>
-            <SectionHeader
-              title="Inventory Positions"
-              subtitle="Primary inventory vs distributor stock — past 12 months"
-            />
+            <SectionHeader title="Inventory Positions" subtitle="Primary inventory vs distributor stock — past 12 months" />
             <ResponsiveContainer width="100%" height={230}>
               <ComposedChart data={inventoryTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }}
-                  tickLine={false} axisLine={false} interval={3}
-                />
-                <YAxis
-                  tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }}
-                  tickLine={false} axisLine={false} width={42}
-                  tickFormatter={fmtK}
-                />
+                <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }} tickLine={false} axisLine={false} interval={3} />
+                <YAxis tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend
-                  wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }}
-                  iconType="circle" iconSize={7}
-                />
+                <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
                 <Line dataKey="primaryInventory" name="Primary Inventory" stroke={T.purple} strokeWidth={2} dot={false} />
-                <Line dataKey="distInventory" name="Distributor Stock" stroke={T.amber} strokeWidth={2} dot={false} strokeDasharray="5 3" />
+                <Line dataKey="distInventory"    name="Distributor Stock"  stroke={T.amber}  strokeWidth={2} dot={false} strokeDasharray="5 3" />
               </ComposedChart>
             </ResponsiveContainer>
           </Panel>
 
-          {/* Bonus & Shock */}
           <Panel>
-            <SectionHeader
-              title="Bonus & Demand Shock Events"
-              subtitle="Free_Qty per month + disruption flags — past 12 months"
-            />
+            <SectionHeader title="Bonus & Demand Shock Events" subtitle="Free_Qty per month + disruption flags — past 12 months" />
             <ResponsiveContainer width="100%" height={230}>
               <ComposedChart data={shockTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
-                <XAxis
-                  dataKey="label"
-                  tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }}
-                  tickLine={false} axisLine={false} interval={3}
-                />
-                <YAxis yAxisId="left" tick={{ fill: T.muted, fontSize: 9 }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
+                <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: "'JetBrains Mono', monospace" }} tickLine={false} axisLine={false} interval={3} />
+                <YAxis yAxisId="left"  tick={{ fill: T.muted, fontSize: 9 }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
                 <YAxis yAxisId="right" orientation="right" domain={[0, 1.5]} hide />
                 <Tooltip content={<CustomTooltip />} />
-                <Legend
-                  wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }}
-                  iconType="circle" iconSize={7}
-                />
-                <Bar yAxisId="left" dataKey="bonusQty"  name="Bonus Qty"    fill={T.amber} opacity={0.85} maxBarSize={16} radius={[3,3,0,0]} />
-                <Bar yAxisId="right" dataKey="bonusFlag"  name="Bonus Flag"  fill="#e3b341"  opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
+                <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
+                <Bar yAxisId="left"  dataKey="bonusQty"   name="Bonus Qty"    fill={T.amber} opacity={0.85} maxBarSize={16} radius={[3,3,0,0]} />
+                <Bar yAxisId="right" dataKey="bonusFlag"  name="Bonus Flag"   fill="#e3b341" opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
                 <Bar yAxisId="right" dataKey="supplyFlag" name="Supply Shock" fill={T.red}   opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
               </ComposedChart>
             </ResponsiveContainer>
           </Panel>
-
         </div>
-
       </>)}
 
       {/* ── Empty state ── */}
       {!result && !loading && (
-        <div style={{
-          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
-          marginTop: 80, gap: 14, color: T.muted,
-        }}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", marginTop: 80, gap: 14, color: T.muted }}>
           <div style={{ fontSize: 40, opacity: 0.3 }}>◈</div>
           <div style={{ fontSize: 14, fontWeight: 600 }}>Enter a SKU to load the forecast dashboard</div>
           <div style={{ fontSize: 12, opacity: 0.6 }}>Powered by XGBoost · Tweedie · Optuna</div>
