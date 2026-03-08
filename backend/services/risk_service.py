@@ -7,7 +7,7 @@ from engines.risk_engine import build_risk_table
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-PROCESSED_PATH = os.path.join(DATA_DIR, "processed_data.csv")
+PROCESSED_LIVE_PATH = os.path.join(DATA_DIR, "processed_data_live.csv")
 FORECAST_PATH = os.path.join(DATA_DIR, "forecast_latest.csv")
 BASE_PATH = os.path.join(DATA_DIR, "base_data_latest.csv")
 RISK_PATH = os.path.join(DATA_DIR, "risk_latest.csv")
@@ -15,13 +15,13 @@ RISK_PATH = os.path.join(DATA_DIR, "risk_latest.csv")
 
 def build_base_snapshot():
     """
-    Create base_data_latest.csv from processed_data.csv
+    Create base_data_latest.csv from processed_data_live.csv
     (latest month per SKU)
     """
-    if not os.path.exists(PROCESSED_PATH):
-        raise FileNotFoundError("processed_data.csv not found. Process raw data first.")
+    if not os.path.exists(PROCESSED_LIVE_PATH):
+        raise FileNotFoundError("processed_data_live.csv not found. Process live raw data first.")
 
-    df = pd.read_csv(PROCESSED_PATH)
+    df = pd.read_csv(PROCESSED_LIVE_PATH)
 
     required_cols = [
         "ItemCode",
@@ -34,7 +34,7 @@ def build_base_snapshot():
     ]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise KeyError(f"processed_data.csv missing columns: {missing}")
+        raise KeyError(f"processed_data_live.csv missing columns: {missing}")
 
     df["ItemCode"] = (
         df["ItemCode"]
@@ -71,10 +71,10 @@ def build_base_snapshot():
 
 
 def run_risk_pipeline():
-    if not os.path.exists(PROCESSED_PATH):
+    if not os.path.exists(PROCESSED_LIVE_PATH):
         return {
             "ok": False,
-            "error": "processed_data.csv not found. Process raw data first."
+            "error": "processed_data_live.csv not found. Process raw data first."
         }
 
     if not os.path.exists(FORECAST_PATH):

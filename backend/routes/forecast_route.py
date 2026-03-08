@@ -9,7 +9,8 @@ from engines.demand_forecast_engine import (
     reload_model_artifacts,
     refresh_model_now,
     retune_model_now,
-    process_raw_now,
+    process_actual_raw_now,
+    process_live_raw_now,
     export_forecast_latest_now,
     get_health,
 )
@@ -65,10 +66,15 @@ def retune_model():
     return jsonify(payload), status
 
 
-@forecast_bp.route("/process_raw", methods=["POST"])
-def process_raw():
-    # engine reads raw file paths internally and rebuilds processed_data.csv
-    payload, status = process_raw_now()
+@forecast_bp.route("/process_actual_raw", methods=["POST"])
+def process_actual_raw():
+    payload, status = process_actual_raw_now()
+    return jsonify(payload), status
+
+
+@forecast_bp.route("/process_live_raw", methods=["POST"])
+def process_live_raw():
+    payload, status = process_live_raw_now()
     return jsonify(payload), status
 
 
