@@ -1,0 +1,8 @@
+2. GRU files are still missing
+
+These warnings mean your backend/models/long/gru/ folder does not contain:
+
+* gru_bundle.pkl
+* gru_scalers.pkl
+
+So GRU branch is not usable yet. That is okay for now if your champion map does not route many items to GRU.

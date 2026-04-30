@@ -1,8 +1,8 @@
-# backend/routes/forecast_route.py
+# backend/routes/forecast_route.py ---> 🌐 API
 
 from flask import Blueprint, request, jsonify
 
-from engines.demand_forecast_engine import (
+from engines.forecast_orchestrator import (
     get_dashboard,
     get_skus,
     reload_data_now,
@@ -16,6 +16,7 @@ from engines.demand_forecast_engine import (
 )
 
 forecast_bp = Blueprint("forecast", __name__)
+
 
 @forecast_bp.route("/", methods=["GET"])
 def home():
@@ -50,8 +51,8 @@ def reload_data():
 
 @forecast_bp.route("/reload_model", methods=["POST"])
 def reload_model():
-    result = reload_model_artifacts()
-    return jsonify(result), 200
+    payload, status = reload_model_artifacts()
+    return jsonify(payload), status
 
 
 @forecast_bp.route("/refresh_model", methods=["POST"])

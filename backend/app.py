@@ -1,15 +1,21 @@
+# backend/app.py
+
 from flask import Flask
 from flask_cors import CORS
+
 from routes.forecast_route import forecast_bp
 from routes.risk_route import risk_bp
+from routes.recommendation_route import recommendation_bp
+from routes.xai_route import xai_bp
 
 def create_app():
     app = Flask(__name__)
     CORS(app)
 
     app.register_blueprint(forecast_bp, url_prefix="/api/forecast")
-
     app.register_blueprint(risk_bp, url_prefix="/api/risk")
+    app.register_blueprint(recommendation_bp, url_prefix="/api/recommendation")
+    app.register_blueprint(xai_bp)
 
     return app
 

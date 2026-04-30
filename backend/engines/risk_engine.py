@@ -1,17 +1,16 @@
-#risk_engine.py
-
 from __future__ import annotations
-import argparse
+
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Tuple
+
 import pandas as pd
 
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 def now_run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -19,8 +18,8 @@ def now_run_id() -> str:
 def _normalize_itemcode(s: pd.Series) -> pd.Series:
     return (
         s.astype(str)
-         .str.strip()
-         .str.replace(r"\.0$", "", regex=True)
+        .str.strip()
+        .str.replace(r"\.0$", "", regex=True)
     )
 
 
@@ -38,8 +37,8 @@ def safe_value(x):
 
 
 def allocate_step(need: float, available: float) -> Tuple[float, float]:
-    used = min(need, available)
-    remaining = need - used
+    used = min(max(need, 0.0), max(available, 0.0))
+    remaining = max(need - used, 0.0)
     return used, remaining
 
 
@@ -49,120 +48,163 @@ def ensure_cols(df: pd.DataFrame, required: List[str], where: str) -> None:
         raise KeyError(f"[{where}] Missing required columns: {missing}")
 
 
-# -----------------------------
-# Core Scenario Evaluation
-# -----------------------------
+# ============================================================
+# RESULT SHAPE
+# ============================================================
 @dataclass
 class ScenarioResult:
     scenario: str
     met_demand: bool
     unmet: float
-    used_distributor: float
-    used_trade: float
-    used_inspection: float
-    used_blocked: float
+
+    used_db_no_risk: float
+    used_db_short_exp: float
+
+    used_wh_trade: float
+    used_wh_inspection: float
+    used_wh_blocked: float
+
     flags: List[str]
     reasoning: List[str]
 
 
-def scenario_A_no_risk_only(F: float, D_NR: float, T_NR: float) -> ScenarioResult:
-    need = F
+# ============================================================
+# SCENARIOS
+# ============================================================
+def scenario_A_no_risk_only(F: float, db_no_risk: float) -> ScenarioResult:
+    """
+    Scenario A:
+    Use only distributor no-risk stock (X)
+    """
+    need = max(F, 0.0)
 
-    used_d, need = allocate_step(need, D_NR)
-    used_t, need = allocate_step(need, T_NR)
+    used_x, need = allocate_step(need, db_no_risk)
 
     flags = []
     if need > 0:
-        flags.append("STOCKOUT_RISK")
+        flags.append("DB_TRADE_REQUIRED")
 
     reasoning = [
-        f"Scenario A (No-Risk only): demand={F}",
-        f"Step 1 Distributor No-Risk: used={used_d} / available={D_NR}, remaining={F - used_d}",
-        f"Step 2 Primary No-Risk: used={used_t} / available={T_NR}, remaining={need}",
-        "Only No-Risk buckets allowed.",
+        f"Scenario A (DB No-Risk only): demand={F}",
+        f"Step 1 Distributor No-Risk: used={used_x} / available={db_no_risk}, remaining={need}",
+        "Only distributor no-risk stock allowed.",
     ]
 
     return ScenarioResult(
         scenario="A_NO_RISK_ONLY",
         met_demand=(need <= 0),
         unmet=need,
-        used_distributor=used_d,
-        used_trade=used_t,
-        used_inspection=0.0,
-        used_blocked=0.0,
+        used_db_no_risk=used_x,
+        used_db_short_exp=0.0,
+        used_wh_trade=0.0,
+        used_wh_inspection=0.0,
+        used_wh_blocked=0.0,
         flags=flags,
         reasoning=reasoning,
     )
 
 
-def scenario_B_trade_allowed(F: float, D_total: float, T_trade: float, D_NR: float, T_NR: float) -> ScenarioResult:
-    need = F
+def scenario_B_trade_allowed(F: float, db_no_risk: float, db_short_exp: float) -> ScenarioResult:
+    """
+    Scenario B:
+    Use distributor trade stock = X + Y
+    where:
+    X = distributor no-risk
+    Y = distributor short-expiry
+    """
+    need = max(F, 0.0)
 
-    used_d, need = allocate_step(need, D_total)
-    used_t, need = allocate_step(need, T_trade)
+    used_x, need = allocate_step(need, db_no_risk)
+    used_y, need = allocate_step(need, db_short_exp)
 
     flags = []
+    if used_y > 0:
+        flags.append("DB_SHORT_EXP_REQUIRED")
     if need > 0:
-        flags.append("STOCKOUT_RISK")
-
-    short_expiry_used = F > (D_NR + T_NR)
-    if short_expiry_used and (need <= 0):
-        flags.append("SHORT_EXPIRY_USED")
+        flags.append("WH_STOCK_REQUIRED")
+    if not flags:
+        flags.append("NO_RISK_COVERED")
 
     reasoning = [
-        f"Scenario B (Trade allowed NR+Short-Expiry): demand={F}",
-        f"Step 1 Distributor (trade): used={used_d} / available={D_total}, remaining={F - used_d}",
-        f"Step 2 Primary Trade: used={used_t} / available={T_trade}, remaining={need}",
-        "Trade stock allowed (includes short-expiry concept). No inspection stock used in this scenario.",
-        "SHORT_EXPIRY_USED is inferred only if No-Risk split exists; otherwise treated as unknown/false.",
+        f"Scenario B (DB Trade = No-Risk + Short-Expiry): demand={F}",
+        f"Step 1 Distributor No-Risk: used={used_x} / available={db_no_risk}, remaining={F - used_x}",
+        f"Step 2 Distributor Short-Expiry: used={used_y} / available={db_short_exp}, remaining={need}",
+        "Distributor trade stock includes no-risk and short-expiry stock.",
     ]
 
     return ScenarioResult(
         scenario="B_TRADE_ALLOWED",
         met_demand=(need <= 0),
         unmet=need,
-        used_distributor=used_d,
-        used_trade=used_t,
-        used_inspection=0.0,
-        used_blocked=0.0,
+        used_db_no_risk=used_x,
+        used_db_short_exp=used_y,
+        used_wh_trade=0.0,
+        used_wh_inspection=0.0,
+        used_wh_blocked=0.0,
         flags=flags,
         reasoning=reasoning,
     )
 
 
-def scenario_C_total_usable(F: float, D_total: float, T_trade: float, I_insp: float, B_blocked: float) -> ScenarioResult:
-    need = F
+def scenario_C_total_usable(
+    F: float,
+    db_no_risk: float,
+    db_short_exp: float,
+    wh_no_risk: float,
+    wh_short_exp: float,
+    wh_insp: float,
+    wh_blocked: float,
+) -> ScenarioResult:
+    """
+    Scenario C:
+    Use X + Y + WH
+    X = distributor no-risk
+    Y = distributor short-expiry
+    WH = primary trade + inspection + blocked
+    """
+    need = max(F, 0.0)
 
-    used_d, need = allocate_step(need, D_total)
-    used_t, need = allocate_step(need, T_trade)
-    used_i, need = allocate_step(need, I_insp)
-    used_b, need = allocate_step(need, B_blocked)
+    used_x, need = allocate_step(need, db_no_risk)
+    used_y, need = allocate_step(need, db_short_exp)
+    used_wh_nr, need = allocate_step(need, wh_no_risk)
+    used_wh_se, need = allocate_step(need, wh_short_exp)
+    used_wh_i, need = allocate_step(need, wh_insp)
+    used_wh_b, need = allocate_step(need, wh_blocked)
 
     flags = []
-    if used_i > 0:
-        flags.append("INSPECTION_USED")
-    if used_b > 0:
-        flags.append("BLOCKED_USED")
+    if used_y > 0:
+        flags.append("DB_SHORT_EXP_REQUIRED")
+    if used_wh_nr > 0:
+        flags.append("WH_NO_RISK_REQUIRED")
+    if used_wh_se > 0:
+        flags.append("WH_SHORT_EXP_REQUIRED")
+    if used_wh_i > 0:
+        flags.append("WH_INSPECTION_REQUIRED")
+    if used_wh_b > 0:
+        flags.append("WH_BLOCKED_REQUIRED")
     if need > 0:
         flags.append("CRITICAL_STOCKOUT")
 
     reasoning = [
-        f"Scenario C (Total usable): demand={F}",
-        f"Step 1 Distributor (trade): used={used_d} / available={D_total}, remaining={F - used_d}",
-        f"Step 2 Primary Trade: used={used_t} / available={T_trade}, remaining={F - used_d - used_t}",
-        f"Step 3 Inspection: used={used_i} / available={I_insp}, remaining={F - used_d - used_t - used_i}",
-        f"Step 4 Blocked: used={used_b} / available={B_blocked}, remaining={need}",
-        "Total usable allows trade + inspection + blocked.",
+        f"Scenario C (DB Trade + Warehouse usable): demand={F}",
+        f"Step 1 Distributor No-Risk: used={used_x} / available={db_no_risk}, remaining={F - used_x}",
+        f"Step 2 Distributor Short-Expiry: used={used_y} / available={db_short_exp}, remaining={F - used_x - used_y}",
+        f"Step 3 Warehouse No-Risk: used={used_wh_nr} / available={wh_no_risk}, remaining={F - used_x - used_y - used_wh_nr}",
+        f"Step 4 Warehouse Short-Expiry: used={used_wh_se} / available={wh_short_exp}, remaining={F - used_x - used_y - used_wh_nr - used_wh_se}",
+        f"Step 5 Inspection: used={used_wh_i} / available={wh_insp}, remaining={F - used_x - used_y - used_wh_nr - used_wh_se - used_wh_i}",
+        f"Step 6 Blocked: used={used_wh_b} / available={wh_blocked}, remaining={need}",
+        "Scenario C includes DB no-risk + DB short-expiry + WH no-risk + WH short-expiry + inspection + blocked.",
     ]
 
     return ScenarioResult(
         scenario="C_TOTAL_USABLE",
         met_demand=(need <= 0),
         unmet=need,
-        used_distributor=used_d,
-        used_trade=used_t,
-        used_inspection=used_i,
-        used_blocked=used_b,
+        used_db_no_risk=used_x,
+        used_db_short_exp=used_y,
+        used_wh_trade=used_wh_nr + used_wh_se,
+        used_wh_inspection=used_wh_i,
+        used_wh_blocked=used_wh_b,
         flags=flags,
         reasoning=reasoning,
     )
@@ -178,22 +220,45 @@ def classify_risk(A: ScenarioResult, B: ScenarioResult, C: ScenarioResult) -> st
     return "CRITICAL_STOCKOUT"
 
 
-# -----------------------------
-# Pipeline
-# -----------------------------
+# ============================================================
+# MAIN BUILD
+# ============================================================
 def build_risk_table(
     base_df: pd.DataFrame,
     forecast_df: pd.DataFrame,
     base_month_col: str = "Month",
-    forecast_month_col: str = "Month",
+    forecast_month_col: str = "Forecast_Month",
     item_col: str = "ItemCode",
     forecast_col: str = "Forecast_Qty",
 ) -> pd.DataFrame:
+    """
+    Expected base_df columns:
+    - ItemCode
+    - Month
+    - Distributor_NoRisk_Qty
+    - Distributor_ShortExp_Qty
+    - Distributor_Expired_Qty
+    - Distributor_Trade_Qty
+    - Primary_NoRisk_Qty
+    - Primary_ShortExp_Qty
+    - Primary_Expired_Qty
+    - Primary_Trade_Qty
+    - Inspection_Stock_Qty
+    - Blocked_Stock_Qty
+
+    Expected forecast_df columns:
+    - ItemCode
+    - Forecast_Qty
+    - Forecast_Month
+    """
 
     required_base = [
         item_col,
-        "Distributor_Inventory_Qty",
-        "Available_Primary_Inventory_Qty",
+        "Distributor_NoRisk_Qty",
+        "Distributor_ShortExp_Qty",
+        "Distributor_Expired_Qty",
+        "Distributor_Trade_Qty",
+        "Primary_Trade_Qty",
         "Inspection_Stock_Qty",
         "Blocked_Stock_Qty",
     ]
@@ -213,8 +278,7 @@ def build_risk_table(
     merged = base_df.merge(
         forecast_df[keep_forecast_cols],
         on=item_col,
-        how="inner",
-        suffixes=("_base", "_forecast"),
+        how="inner"
     )
 
     run_id = now_run_id()
@@ -223,105 +287,104 @@ def build_risk_table(
     for _, r in merged.iterrows():
         item = r[item_col]
 
-        base_month = safe_value(r.get(f"{base_month_col}_base", r.get(base_month_col, None)))
-        forecast_month = safe_value(r.get(f"{forecast_month_col}_forecast", r.get(forecast_month_col, None)))
+        base_month = safe_value(r.get(base_month_col, None))
+        forecast_month = safe_value(r.get(forecast_month_col, None))
 
         F = safe_float(r[forecast_col])
 
-        D_total = safe_float(r["Distributor_Inventory_Qty"])
-        T_trade = safe_float(r["Available_Primary_Inventory_Qty"])
-        I_insp = safe_float(r["Inspection_Stock_Qty"])
-        B_blocked = safe_float(r["Blocked_Stock_Qty"])
+        # Distributor buckets
+        db_no_risk = safe_float(r.get("Distributor_NoRisk_Qty", 0))
+        db_short_exp = safe_float(r.get("Distributor_ShortExp_Qty", 0))
+        db_expired = safe_float(r.get("Distributor_Expired_Qty", 0))
+        db_trade = db_no_risk + db_short_exp
 
-        D_NR = safe_float(r.get("Distributor_NoRisk_Qty", D_total))
-        T_NR = safe_float(r.get("Primary_NoRisk_Qty", T_trade))
+        # Primary / warehouse buckets
+        primary_no_risk = safe_float(r.get("Primary_NoRisk_Qty", 0))
+        primary_short_exp = safe_float(r.get("Primary_ShortExp_Qty", 0))
+        primary_expired = safe_float(r.get("Primary_Expired_Qty", 0))
+        primary_trade = primary_no_risk + primary_short_exp
+        inspection_qty = safe_float(r.get("Inspection_Stock_Qty", 0))
+        blocked_qty = safe_float(r.get("Blocked_Stock_Qty", 0))
 
-        A = scenario_A_no_risk_only(F, D_NR, T_NR)
-        B = scenario_B_trade_allowed(F, D_total, T_trade, D_NR, T_NR)
-        C = scenario_C_total_usable(F, D_total, T_trade, I_insp, B_blocked)
+        A = scenario_A_no_risk_only(F, db_no_risk)
+        B = scenario_B_trade_allowed(F, db_no_risk, db_short_exp)
+        C = scenario_C_total_usable(
+            F,
+            db_no_risk,
+            db_short_exp,
+            primary_no_risk,
+            primary_short_exp,
+            inspection_qty,
+            blocked_qty,
+        )
 
         risk_level = classify_risk(A, B, C)
 
-        out_rows.append(
-            {
-                "run_id": run_id,
-                "Base_Month": base_month,
-                "Forecast_Month": forecast_month,
-                "ItemCode": item,
-                "Forecast_Qty": F,
+        out_rows.append({
+            "run_id": run_id,
+            "Base_Month": base_month,
+            "Forecast_Month": forecast_month,
+            "ItemCode": item,
+            "Forecast_Qty": F,
 
-                "A_met": A.met_demand,
-                "A_unmet": A.unmet,
-                "A_used_dist": A.used_distributor,
-                "A_used_trade": A.used_trade,
-                "A_flags": json.dumps(A.flags),
-                "A_reasoning": json.dumps(A.reasoning),
+            # -------------------------
+            # KPI STOCK BUCKETS
+            # -------------------------
+            "Distributor_NoRisk_Qty": db_no_risk,
+            "Distributor_ShortExp_Qty": db_short_exp,
+            "Distributor_Expired_Qty": db_expired,
+            "Distributor_Trade_Qty": db_trade,
 
-                "B_met": B.met_demand,
-                "B_unmet": B.unmet,
-                "B_used_dist": B.used_distributor,
-                "B_used_trade": B.used_trade,
-                "B_flags": json.dumps(B.flags),
-                "B_reasoning": json.dumps(B.reasoning),
+            "Primary_NoRisk_Qty": primary_no_risk,
+            "Primary_ShortExp_Qty": primary_short_exp,
+            "Primary_Expired_Qty": primary_expired,
+            "Primary_Trade_Qty": primary_trade,
+            "Inspection_Stock_Qty": inspection_qty,
+            "Blocked_Stock_Qty": blocked_qty,
 
-                "C_met": C.met_demand,
-                "C_unmet": C.unmet,
-                "C_used_dist": C.used_distributor,
-                "C_used_trade": C.used_trade,
-                "C_used_insp": C.used_inspection,
-                "C_used_block": C.used_blocked,
-                "C_flags": json.dumps(C.flags),
-                "C_reasoning": json.dumps(C.reasoning),
+            # -------------------------
+            # Scenario A
+            # -------------------------
+            "A_met": A.met_demand,
+            "A_unmet": A.unmet,
+            "A_used_db_no_risk": A.used_db_no_risk,
+            "A_used_db_short_exp": A.used_db_short_exp,
+            "A_used_wh_trade": A.used_wh_trade,
+            "A_used_wh_insp": A.used_wh_inspection,
+            "A_used_wh_blocked": A.used_wh_blocked,
+            "A_flags": json.dumps(A.flags),
+            "A_reasoning": json.dumps(A.reasoning),
 
-                "Risk_Level": risk_level,
-            }
-        )
+            # -------------------------
+            # Scenario B
+            # -------------------------
+            "B_met": B.met_demand,
+            "B_unmet": B.unmet,
+            "B_used_db_no_risk": B.used_db_no_risk,
+            "B_used_db_short_exp": B.used_db_short_exp,
+            "B_used_wh_trade": B.used_wh_trade,
+            "B_used_wh_insp": B.used_wh_inspection,
+            "B_used_wh_blocked": B.used_wh_blocked,
+            "B_flags": json.dumps(B.flags),
+            "B_reasoning": json.dumps(B.reasoning),
+
+            # -------------------------
+            # Scenario C
+            # -------------------------
+            "C_met": C.met_demand,
+            "C_unmet": C.unmet,
+            "C_used_db_no_risk": C.used_db_no_risk,
+            "C_used_db_short_exp": C.used_db_short_exp,
+            "C_used_wh_trade": C.used_wh_trade,
+            "C_used_wh_insp": C.used_wh_inspection,
+            "C_used_wh_blocked": C.used_wh_blocked,
+            "C_flags": json.dumps(C.flags),
+            "C_reasoning": json.dumps(C.reasoning),
+
+            # -------------------------
+            # Final class
+            # -------------------------
+            "Risk_Level": risk_level,
+        })
 
     return pd.DataFrame(out_rows)
-
-
-def run_risk_engine(base_path: str, forecast_path: str, out_path: str):
-    base_df = pd.read_csv(base_path)
-    forecast_df = pd.read_csv(forecast_path)
-
-    risk_df = build_risk_table(base_df, forecast_df)
-    risk_df.to_csv(out_path, index=False)
-
-    return {
-        "rows": int(len(risk_df)),
-        "path": out_path,
-        "run_id": risk_df["run_id"].iloc[0] if len(risk_df) else None
-    }
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Phase-1 Risk Engine (pure stock projection).")
-    parser.add_argument("--base", required=True)
-    parser.add_argument("--forecast", required=True)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--base-month-col", default="Month")
-    parser.add_argument("--forecast-month-col", default="Month")
-    parser.add_argument("--item-col", default="ItemCode")
-    parser.add_argument("--forecast-col", default="Forecast_Qty")
-
-    args = parser.parse_args()
-
-    base_df = pd.read_csv(args.base)
-    forecast_df = pd.read_csv(args.forecast)
-
-    risk_df = build_risk_table(
-        base_df=base_df,
-        forecast_df=forecast_df,
-        base_month_col=args.base_month_col,
-        forecast_month_col=args.forecast_month_col,
-        item_col=args.item_col,
-        forecast_col=args.forecast_col,
-    )
-
-    risk_df.to_csv(args.out, index=False)
-    print(f"✅ Risk output saved: {args.out}")
-    print(f"Rows: {len(risk_df)} | run_id: {risk_df['run_id'].iloc[0] if len(risk_df) else 'N/A'}")
-
-
-if __name__ == "__main__":
-    main()
