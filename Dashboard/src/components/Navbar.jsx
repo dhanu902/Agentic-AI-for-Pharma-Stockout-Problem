@@ -1,65 +1,94 @@
+// src/components/Navbar.jsx
+// UI v2 — visual upgrade only; routing/logic unchanged.
+
 import { NavLink, useLocation } from "react-router-dom";
+import T from "../theme";
 
-const T = {
-  bg:     "#080c12",
-  border: "#1e2a3a",
-  muted:  "#4a6080",
-  blue:   "#3b82f6",
-  orange: "#f97316",
-};
+const FONT_UI = "'Inter', 'IBM Plex Sans', sans-serif";
 
-function Navbar() {
-  const location  = useLocation();
+/* Recommendation page accent — distinct from Inventory's orange.
+   Swap for a T token (e.g. T.rose / T.red) if one exists in theme.js. */
+const REC_ACCENT = "#E11D48";
+
+export default function Navbar() {
+  const location   = useLocation();
   const currentSku = new URLSearchParams(location.search).get("sku") || "";
-  const withSku   = (path) => currentSku ? `${path}?sku=${currentSku}` : path;
+  const withSku    = (path) => currentSku ? `${path}?sku=${currentSku}` : path;
 
   const base = {
     textDecoration: "none", fontWeight: 700, fontSize: 13,
-    padding: "7px 14px", borderRadius: 8,
-    transition: "all 0.15s ease", letterSpacing: 0.2,
-    fontFamily: "'IBM Plex Sans', sans-serif",
+    padding: "8px 16px", borderRadius: 999,
+    transition: "all 0.18s cubic-bezier(0.22,1,0.36,1)", letterSpacing: 0.2,
+    fontFamily: FONT_UI,
+    display: "inline-flex", alignItems: "center", gap: 7,
   };
 
-  const blueStyle = ({ isActive }) => ({
+  /* Each nav item has its own page accent colour */
+  const makeStyle = (activeColor) => ({ isActive }) => ({
     ...base,
-    color:      isActive ? T.blue   : T.muted,
-    background: isActive ? T.blue   + "15" : "transparent",
-    border:    `1px solid ${isActive ? T.blue   + "33" : "transparent"}`,
+    color:      isActive ? activeColor : T.muted,
+    background: isActive ? activeColor + "14" : "transparent",
+    border:    `1px solid ${isActive ? activeColor + "3D" : "transparent"}`,
+    boxShadow:  isActive ? `inset 0 1px 0 ${activeColor}1A` : "none",
   });
 
-  const orangeStyle = ({ isActive }) => ({
-    ...base,
-    color:      isActive ? T.orange : T.muted,
-    background: isActive ? T.orange + "15" : "transparent",
-    border:    `1px solid ${isActive ? T.orange + "33" : "transparent"}`,
-  });
+  /* Active-dot rendered via NavLink children function */
+  const linkContent = (label, color) => ({ isActive }) => (
+    <>
+      {isActive && <span style={{ width: 6, height: 6, borderRadius: "50%",
+        background: color, boxShadow: `0 0 0 3px ${color}22`, flexShrink: 0 }} />}
+      {label}
+    </>
+  );
 
   return (
     <nav style={{
-      background: T.bg, borderBottom: `1px solid ${T.border}`,
-      padding: "12px 28px", display: "flex", alignItems: "center", gap: 4,
+      position: "sticky", top: 0, zIndex: 100,
+      background: `linear-gradient(180deg, ${T.surface}F7, ${T.surface}E8)`,
+      backdropFilter: "blur(12px)",
+      WebkitBackdropFilter: "blur(12px)",
+      borderBottom: `1px solid ${T.border}`,
+      boxShadow: "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -20px rgba(15,23,42,0.25)",
+      padding: "11px 28px", display: "flex", alignItems: "center", gap: 6,
     }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+        .nav-link-v2:hover { transform: translateY(-1px); }
+      `}</style>
+
       {/* Brand */}
       <div style={{
-        display: "flex", alignItems: "center", gap: 8,
+        display: "flex", alignItems: "center", gap: 10,
         marginRight: 20, paddingRight: 20, borderRight: `1px solid ${T.border}`,
       }}>
         <div style={{
-          width: 22, height: 22,
-          background: `linear-gradient(135deg, ${T.blue}, #2dd4bf)`,
-          borderRadius: 6, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12,
+          width: 28, height: 28,
+          background: `linear-gradient(135deg, ${T.blue}, ${T.teal})`,
+          borderRadius: 8, display: "flex", alignItems: "center",
+          justifyContent: "center", fontSize: 13, color: "#fff",
+          boxShadow: `0 6px 14px -6px ${T.blue}99`,
         }}>◈</div>
-        <span style={{ fontSize: 10, letterSpacing: 3, color: T.muted, textTransform: "uppercase", fontWeight: 700, fontFamily: "'IBM Plex Sans', sans-serif" }}>
-          SKU Intelligence
-        </span>
+        <div>
+          <div style={{
+            fontSize: 10, letterSpacing: 3, color: T.text,
+            textTransform: "uppercase", fontWeight: 900,
+            fontFamily: FONT_UI, lineHeight: 1.2,
+          }}>
+            SKU Intelligence
+          </div>
+          <div style={{ fontSize: 8, letterSpacing: 1.6, color: T.muted,
+            textTransform: "uppercase", fontWeight: 700, fontFamily: FONT_UI }}>
+            Pharma Supply Suite
+          </div>
+        </div>
       </div>
 
-      <NavLink to={withSku("/")}                style={blueStyle}>Forecast</NavLink>
-      <NavLink to={withSku("/inventory")}       style={blueStyle}>Inventory</NavLink>
-      <NavLink to={withSku("/recommendation")}  style={blueStyle}>Recommendation</NavLink>
-      <NavLink to="/admin"                      style={blueStyle}>Admin</NavLink>
+      {/* ── Nav links — Insights first, then the pipeline order ── */}
+      <NavLink className="nav-link-v2" to="/insights"             style={makeStyle(T.purple)}>{linkContent("Insights", T.purple)}</NavLink>
+      <NavLink className="nav-link-v2" to={withSku("/")}          style={makeStyle(T.blue)}>{linkContent("Forecast", T.blue)}</NavLink>
+      <NavLink className="nav-link-v2" to={withSku("/inventory")} style={makeStyle(T.orange)}>{linkContent("Inventory", T.orange)}</NavLink>
+      <NavLink className="nav-link-v2" to={withSku("/recommendation")} style={makeStyle(REC_ACCENT)}>{linkContent("Recommend", REC_ACCENT)}</NavLink>
+      <NavLink className="nav-link-v2" to="/admin"                style={makeStyle(T.teal)}>{linkContent("Admin", T.teal)}</NavLink>
     </nav>
   );
 }
-
-export default Navbar;

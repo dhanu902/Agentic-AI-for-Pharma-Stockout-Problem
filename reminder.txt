@@ -6,3 +6,162 @@ These warnings mean your backend/models/long/gru/ folder does not contain:
 * gru_scalers.pkl
 
 So GRU branch is not usable yet. That is okay for now if your champion map does not route many items to GRU.
+
+Pre Process:
+    1) Engines:
+        - Pre Process Engine
+
+Demand Forecast:
+    1) Engines:
+        - Demand Forecast Engine
+        - Forecast Ochestrator Engine 
+    2) Services:
+        - Artifact Service
+        - Forecast Service
+    3) Routes:
+        - Forecast Route
+
+Rinsk Engine:
+    1) Engines:
+        - Risk Engine
+        - Inventory Engine
+        - Horizon Engine
+    2) Services:
+        - Risk Service
+        - Supply Service
+    3) Routes:
+        - Risk Route
+
+Recommendation Engine:
+    1) Recommendation Engine
+    2) Recommendation Service
+    3) Recommendation Route
+
+XAI:
+    1) XAI Engine
+    2) XAI Service
+    3) XAI Route
+
+
+RAW DATA
+│
+├── fact_monthly_closed.xlsx
+├── fact_open_month_snapshot.csv
+│
+▼
+forecast_service.py
+(File Management)
+│
+▼
+preprocess_engine.py
+(Feature Engineering)
+│
+├── Demand reconstruction
+├── Bonus detection
+├── Stock pressure
+├── Debiasing
+├── Promo profiling
+├── Segmentation
+│
+▼
+processed_data_actual.csv
+processed_data_live.csv
+│
+▼
+forecast_orchestrator.py
+(Runtime Manager)
+│
+├── Merge actual + snapshot
+├── Refresh runtime
+├── Dashboard generation
+│
+▼
+demand_forecast_engine.py
+(Prediction Engine)
+│
+├── Rebuild future row
+├── Recalculate features
+├── Segment routing
+├── Champion selection
+├── Forecast generation
+│
+▼
+artifact_service.py
+(Model Loader)
+│
+├── XGB
+├── CatBoost
+├── LGBM
+├── GRU
+├── Champion Maps
+│
+▼
+forecast_latest.csv
+│
+▼
+Frontend Dashboard / Risk Engine / Recommendation Engine
+
+forecast_latest.csv
+        │
+        ▼
+risk_service.py
+        │
+        ├── inventory_engine.py
+        │       └── Inventory.xlsx
+        │             ├── DB sheet
+        │             └── WH sheet
+        │
+        ├── risk_engine.py
+        │       └── Scenario A / B / C risk classification
+        │
+        ├── horizon_engine.py
+        │       └── 6-month depletion projection
+        │
+        └── supply_service.py
+                └── Upcoming_Supply.xlsx
+
+
+6. Recommended Next Fields (future)
+
+Later you can add:
+
+Feature	Purpose
+Supplier lead time	import delays
+Regulatory release status	customs delay
+Port clearance status	GRN confidence
+ETA confidence	probabilistic arrival
+PO aging	stuck shipment
+Replenishment qty suggestion	procurement recommendation
+Alternative SKU	substitution logic
+Transfer recommendation	WH-to-WH balancing
+
+Your architecture now supports all of these cleanly.
+
+🔴 < 0%	22
+🟠 0% – 50%	120
+🟡 50% – 80%	272
+🟢 80% – 100%	268
+
+
+runflow of DF:
+# 1. Update fact_monthly_closed.xlsx/csv with new closed month
+
+# 2. Process actual data
+curl -X POST http://127.0.0.1:5001/api/forecast/process_actual_raw
+
+# 3. Export M+1 forecast
+curl -X POST http://127.0.0.1:5001/api/forecast/export
+
+# 4. Export M+1 to M+6 horizon
+curl -X POST http://127.0.0.1:5001/api/forecast/export_horizon
+
+# 5. Check health
+curl http://127.0.0.1:5001/api/forecast/health
+curl -X POST http://127.0.0.1:5001/api/forecast/process_actual_raw
+curl -X POST http://127.0.0.1:5001/api/forecast/export
+curl -X POST http://127.0.0.1:5001/api/forecast/export_horizon
+curl http://127.0.0.1:5001/api/forecast/health
+
+1. Load Month-End Data
+2. Generate Forecast File
+3. Generate Horizon Forecast

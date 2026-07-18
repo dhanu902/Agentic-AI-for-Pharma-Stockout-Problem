@@ -3,10 +3,12 @@
 import os
 import json
 import joblib
+import warnings
 import pandas as pd
 import torch
 from dataclasses import dataclass
 import torch.nn as nn
+from typing import Optional
 
 
 class LongGRUResidualForecaster(nn.Module):
@@ -57,9 +59,9 @@ class LongGRUResidualForecaster(nn.Module):
         out, _ = self.gru(x_seq)
         last_hidden = out[:, -1, :]
 
-        seq_repr = self.seq_fc(last_hidden)
+        seq_repr    = self.seq_fc(last_hidden)
         static_repr = self.static_fc(x_static)
-        item_repr = self.item_embedding(x_item)
+        item_repr   = self.item_embedding(x_item)
 
         x = torch.cat([seq_repr, static_repr, item_repr], dim=1)
         pred_res_log = self.head(x).squeeze(1)
@@ -71,23 +73,30 @@ class LongGRUScalerBundle:
     seq_scaler: object
     static_scaler: object
 
+
 class ArtifactService:
     def __init__(self):
-        self.BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # backend/
+        self.BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend/
         self.MODELS_DIR = os.path.join(self.BASE_DIR, "models")
 
-        self.champion_long_map_df = None
+        self.champion_long_map_df   = None
         self.champion_medium_map_df = None
 
-        self.long_artifacts = {}
+        self.long_artifacts   = {}
         self.medium_artifacts = {}
 
-        self.short_rule_artifacts = None
-        self.short_promo_artifacts = None
+        self.short_rule_artifacts   = None
+        self.short_promo_artifacts  = None
         self.short_normal_artifacts = None
 
-        self.gru_bundle = None
+        self.gru_bundle  = None
         self.gru_scalers = None
+
+        # FIXED: track run_ids to detect champion-map / artifact version mismatches
+        self._champion_long_run_id   = None
+        self._champion_medium_run_id = None
+        self._long_artifact_run_ids  = {}   # model_name -> run_id
+        self._medium_artifact_run_ids = {}  # (subgroup, model_name) -> run_id
 
     # ============================================================
     # BASIC HELPERS
@@ -110,23 +119,70 @@ class ArtifactService:
         return None
 
     # ============================================================
+    # FIXED: version check helper
+    # Warns when champion maps and model artifacts have different run_ids,
+    # which indicates a partial re-train that may produce mismatched routing.
+    # ============================================================
+    def _extract_run_id(self, obj) -> Optional[str]:
+        """Return run_id from a loaded artifact dict or DataFrame, or None."""
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get("run_id") or obj.get("Run_ID")
+        if isinstance(obj, pd.DataFrame) and "run_id" in obj.columns:
+            return str(obj["run_id"].iloc[0]) if len(obj) else None
+        return None
+
+    def _check_version_consistency(self):
+        """
+        Emit a warning if any loaded model artifact has a different run_id
+        from its champion map.  This is a soft check — inference continues,
+        but the operator is alerted to re-run the full pipeline.
+        """
+        issues = []
+
+        for model_name, run_id in self._long_artifact_run_ids.items():
+            if run_id and self._champion_long_run_id and run_id != self._champion_long_run_id:
+                issues.append(
+                    f"LONG champion map run_id={self._champion_long_run_id} "
+                    f"!= {model_name} artifact run_id={run_id}"
+                )
+
+        for key, run_id in self._medium_artifact_run_ids.items():
+            if run_id and self._champion_medium_run_id and run_id != self._champion_medium_run_id:
+                issues.append(
+                    f"MEDIUM champion map run_id={self._champion_medium_run_id} "
+                    f"!= {key} artifact run_id={run_id}"
+                )
+
+        if issues:
+            for msg in issues:
+                warnings.warn(
+                    f"[ArtifactService VERSION MISMATCH] {msg}. "
+                    "Champion map and model artifacts may be out of sync. "
+                    "Re-run the full training pipeline to fix.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
+    # ============================================================
     # LOAD ALL
     # ============================================================
     def load_all(self):
         registry_dir = os.path.join(self.MODELS_DIR, "registry")
-        long_dir = os.path.join(self.MODELS_DIR, "long")
-        medium_dir = os.path.join(self.MODELS_DIR, "medium")
-        short_dir = os.path.join(self.MODELS_DIR, "short")
+        long_dir     = os.path.join(self.MODELS_DIR, "long")
+        medium_dir   = os.path.join(self.MODELS_DIR, "medium")
+        short_dir    = os.path.join(self.MODELS_DIR, "short")
 
         # ---------------------------
         # Champion maps
         # ---------------------------
         self.champion_long_map_df = self._load_first_existing([
-            os.path.join(registry_dir, "champion_long.pkl"),
+            os.path.join(registry_dir, "champion_long_map_df.pkl"),
         ])
 
         self.champion_medium_map_df = self._load_first_existing([
-            os.path.join(registry_dir, "champion_medium.pkl"),
+            os.path.join(registry_dir, "champion_medium_map_df.pkl"),
         ])
 
         if isinstance(self.champion_long_map_df, pd.DataFrame) and "ItemCode" in self.champion_long_map_df.columns:
@@ -143,21 +199,26 @@ class ArtifactService:
                 .str.replace(r"\.0$", "", regex=True)
             )
 
+        # FIXED: store champion map run_ids for version checking
+        self._champion_long_run_id   = self._extract_run_id(self.champion_long_map_df)
+        self._champion_medium_run_id = self._extract_run_id(self.champion_medium_map_df)
+
         # ---------------------------
         # LONG artifacts
         # ---------------------------
         self.long_artifacts = {}
 
         long_candidates = {
-            "XGBOOST": [os.path.join(long_dir, "xgb_long.pkl")],
+            "XGBOOST":  [os.path.join(long_dir, "xgboost_long.pkl")],
             "CATBOOST": [os.path.join(long_dir, "catboost_long.pkl")],
-            "LIGHTGBM": [os.path.join(long_dir, "lgbm_long.pkl")],
         }
 
         for model_name, paths in long_candidates.items():
             art = self._load_first_existing(paths)
             if art is not None:
                 self.long_artifacts[model_name] = art
+                # FIXED: capture run_id for version consistency check
+                self._long_artifact_run_ids[model_name] = self._extract_run_id(art)
 
         # ---------------------------
         # MEDIUM artifacts
@@ -165,38 +226,27 @@ class ArtifactService:
         self.medium_artifacts = {}
 
         medium_candidates = {
-            ("PROMO_HEAVY", "XGBOOST"): [
-                os.path.join(medium_dir, "promo_heavy", "xgboost.pkl"),
-            ],
-            ("PROMO_HEAVY", "CATBOOST"): [
-                os.path.join(medium_dir, "promo_heavy", "catboost.pkl"),
-            ],
-            ("STABLE", "RANDOM_FOREST"): [
-                os.path.join(medium_dir, "stable", "random_forest.pkl"),
-            ],
+            ("PROMO_HEAVY", "XGBOOST"):       [os.path.join(medium_dir, "promo_heavy", "xgboost.pkl")],
+            ("PROMO_HEAVY", "CATBOOST"):      [os.path.join(medium_dir, "promo_heavy", "catboost.pkl")],
+            ("STABLE",      "XGBOOST"):       [os.path.join(medium_dir, "stable", "xgboost.pkl")],
+            ("STABLE",      "CATBOOST"):      [os.path.join(medium_dir, "stable", "catboost.pkl")],
+            ("STABLE",      "RANDOM_FOREST"): [os.path.join(medium_dir, "stable", "random_forest.pkl")],
         }
 
         for key, paths in medium_candidates.items():
             art = self._load_first_existing(paths)
             if art is not None:
                 self.medium_artifacts[key] = art
+                # FIXED: capture run_id for version consistency check
+                self._medium_artifact_run_ids[key] = self._extract_run_id(art)
 
         # ---------------------------
         # SHORT artifacts
         # ---------------------------
-        self.short_rule_artifacts = self._load_first_existing([
-            os.path.join(short_dir, "base_rule.pkl"),
-        ])
+        self.short_rule_artifacts   = self._load_first_existing([os.path.join(short_dir, "base_rule.pkl")])
+        self.short_promo_artifacts  = self._load_first_existing([os.path.join(short_dir, "promo_rule.pkl")])
+        self.short_normal_artifacts = self._load_first_existing([os.path.join(short_dir, "normal_rule.pkl")])
 
-        self.short_promo_artifacts = self._load_first_existing([
-            os.path.join(short_dir, "promo_rule.pkl"),
-        ])
-
-        self.short_normal_artifacts = self._load_first_existing([
-            os.path.join(short_dir, "normal_rule.pkl"),
-        ])
-
-        
         # ---------------------------
         # GRU artifacts
         # ---------------------------
@@ -211,37 +261,35 @@ class ArtifactService:
                 gru_dir = p
                 break
 
-        self.gru_bundle = None
+        self.gru_bundle  = None
         self.gru_scalers = None
 
         if gru_dir is not None:
-            model_pt_path = os.path.join(gru_dir, "gru_long_deploy_model.pt")
-            seq_scaler_path = os.path.join(gru_dir, "gru_long_seq_scaler.pkl")
-            static_scaler_path = os.path.join(gru_dir, "gru_long_static_scaler.pkl")
-            promo_profile_path = os.path.join(gru_dir, "gru_long_promo_profile_df.pkl")
-            sku_profile_path = os.path.join(gru_dir, "gru_long_sku_profile_df.pkl")
-            item_to_idx_path = os.path.join(gru_dir, "gru_long_item_to_idx.pkl")
-            itemcode_categories_path = os.path.join(gru_dir, "gru_long_itemcode_categories.pkl")
-            meta_json_path = os.path.join(gru_dir, "gru_long_deploy_meta.json")
+            model_pt_path             = os.path.join(gru_dir, "gru_long_deploy_model.pt")
+            seq_scaler_path           = os.path.join(gru_dir, "gru_long_seq_scaler.pkl")
+            static_scaler_path        = os.path.join(gru_dir, "gru_long_static_scaler.pkl")
+            promo_profile_path        = os.path.join(gru_dir, "gru_long_promo_profile_df.pkl")
+            sku_profile_path          = os.path.join(gru_dir, "gru_long_sku_profile_df.pkl")
+            item_to_idx_path          = os.path.join(gru_dir, "gru_long_item_to_idx.pkl")
+            itemcode_categories_path  = os.path.join(gru_dir, "gru_long_itemcode_categories.pkl")
+            meta_json_path            = os.path.join(gru_dir, "gru_long_deploy_meta.json")
 
             required_paths = [
                 model_pt_path,
                 seq_scaler_path,
                 static_scaler_path,
-                promo_profile_path,
-                sku_profile_path,
                 item_to_idx_path,
+                itemcode_categories_path,
             ]
 
             if all(os.path.exists(p) for p in required_paths):
                 try:
-                    artifact = torch.load(model_pt_path, map_location="cpu")
-
-                    seq_scaler = joblib.load(seq_scaler_path)
-                    static_scaler = joblib.load(static_scaler_path)
-                    promo_profile_df = joblib.load(promo_profile_path)
-                    sku_profile_df = joblib.load(sku_profile_path)
-                    item_to_idx = joblib.load(item_to_idx_path)
+                    artifact     = torch.load(model_pt_path, map_location="cpu")
+                    seq_scaler   = joblib.load(seq_scaler_path)
+                    static_scaler= joblib.load(static_scaler_path)
+                    promo_profile_df = joblib.load(promo_profile_path) if os.path.exists(promo_profile_path) else None
+                    sku_profile_df   = joblib.load(sku_profile_path)   if os.path.exists(sku_profile_path)   else None
+                    item_to_idx      = joblib.load(item_to_idx_path)
 
                     itemcode_categories = None
                     if os.path.exists(itemcode_categories_path):
@@ -252,13 +300,20 @@ class ArtifactService:
                         with open(meta_json_path, "r") as f:
                             deploy_meta = json.load(f)
 
-                    seq_features = artifact.get("seq_features", deploy_meta.get("seq_features", []))
+                    seq_features    = artifact.get("seq_features",    deploy_meta.get("seq_features", []))
                     static_features = artifact.get("static_features", deploy_meta.get("static_features", []))
-                    seq_len = artifact.get("seq_len", deploy_meta.get("seq_len", 18))
-                    embed_dim = artifact.get("embed_dim", deploy_meta.get("embed_dim", 32))
-                    hidden_size = artifact.get("hidden_size", deploy_meta.get("hidden_size", 64))
-                    num_layers = artifact.get("num_layers", deploy_meta.get("num_layers", 2))
-                    dropout = artifact.get("dropout", deploy_meta.get("dropout", 0.25))
+                    seq_len         = artifact.get("seq_len",         deploy_meta.get("seq_len", 18))
+                    embed_dim       = artifact.get("embed_dim",       deploy_meta.get("embed_dim", 32))
+                    hidden_size     = artifact.get("hidden_size",     deploy_meta.get("hidden_size", 64))
+                    num_layers      = artifact.get("num_layers",      deploy_meta.get("num_layers", 2))
+                    dropout         = artifact.get("dropout",         deploy_meta.get("dropout", 0.25))
+
+                    # FIXED: read gru_log_clip_value from the saved artifact so
+                    # inference uses the exact same clip boundary used during training
+                    gru_log_clip_value = float(
+                        artifact.get("gru_log_clip_value",
+                                     deploy_meta.get("gru_log_clip_value", 7.0))
+                    )
 
                     model = LongGRUResidualForecaster(
                         num_items=len(item_to_idx),
@@ -274,22 +329,25 @@ class ArtifactService:
                     model.eval()
 
                     self.gru_bundle = {
-                        "model": model,
-                        "model_type": artifact.get("model_type", "GRU"),
-                        "model_name": "GRU",
-                        "segment": artifact.get("segment", "LONG"),
-                        "seq_features": seq_features,
-                        "static_features": static_features,
-                        "seq_len": seq_len,
-                        "embed_dim": embed_dim,
-                        "hidden_size": hidden_size,
-                        "num_layers": num_layers,
-                        "dropout": dropout,
-                        "item_to_idx": item_to_idx,
-                        "abc_map": artifact.get("abc_map", {}),
-                        "clip_caps": artifact.get("clip_caps", {}),
-                        "promo_profile_df": promo_profile_df,
-                        "sku_profile_df": sku_profile_df,
+                        "model":               model,
+                        "model_type":          artifact.get("model_type", "GRU"),
+                        "model_name":          "GRU",
+                        "segment":             artifact.get("segment", "LONG"),
+                        "seq_features":        seq_features,
+                        "static_features":     static_features,
+                        "seq_len":             seq_len,
+                        "embed_dim":           embed_dim,
+                        "hidden_size":         hidden_size,
+                        "num_layers":          num_layers,
+                        "dropout":             dropout,
+                        "item_to_idx":         item_to_idx,
+                        "abc_map":             artifact.get("abc_map", {}),
+                        "clip_caps":           artifact.get("clip_caps", {}),
+                        # FIXED: expose the clip value in the bundle so
+                        # demand_forecast_engine.py can read it at inference time
+                        "gru_log_clip_value":  gru_log_clip_value,
+                        "promo_profile_df":    promo_profile_df,
+                        "sku_profile_df":      sku_profile_df,
                         "itemcode_categories": itemcode_categories,
                     }
 
@@ -300,33 +358,49 @@ class ArtifactService:
 
                 except Exception as e:
                     print(f"[WARN] Failed to load GRU artifacts: {e}")
-                    self.gru_bundle = None
+                    self.gru_bundle  = None
                     self.gru_scalers = None
             else:
                 for p in required_paths:
                     if not os.path.exists(p):
                         print(f"[WARN] Missing file: {p}")
 
-
+        # FIXED: run version consistency check after all artifacts are loaded
+        self._check_version_consistency()
 
     # ============================================================
     # SUMMARY
     # ============================================================
     def summary(self):
+        # FIXED: device is derived from the actual loaded model weights, not hardcoded
+        if self.gru_bundle is not None:
+            try:
+                device_str = str(next(self.gru_bundle["model"].parameters()).device)
+            except Exception:
+                device_str = "unknown"
+        else:
+            device_str = "cpu"
+
         return {
-            "champion_long_loaded": self.champion_long_map_df is not None,
-            "champion_medium_loaded": self.champion_medium_map_df is not None,
-            "long_models_loaded": sorted(list(self.long_artifacts.keys())),
-            "medium_models_loaded": [f"{k[0]}::{k[1]}" for k in sorted(self.medium_artifacts.keys())],
+            "champion_long_loaded":    self.champion_long_map_df is not None,
+            "champion_medium_loaded":  self.champion_medium_map_df is not None,
+            "long_models_loaded":      sorted(list(self.long_artifacts.keys())),
+            "medium_models_loaded":    [f"{k[0]}::{k[1]}" for k in sorted(self.medium_artifacts.keys())],
             "short_rules_loaded": [
                 name for name, obj in [
-                    ("BASE_RULE", self.short_rule_artifacts),
-                    ("PROMO_RULE", self.short_promo_artifacts),
+                    ("BASE_RULE",   self.short_rule_artifacts),
+                    ("PROMO_RULE",  self.short_promo_artifacts),
                     ("NORMAL_RULE", self.short_normal_artifacts),
                 ] if obj is not None
             ],
-            "gru_long_loaded": self.gru_bundle is not None and self.gru_scalers is not None,
-            "device": "mps",
+            "gru_long_loaded":         self.gru_bundle is not None and self.gru_scalers is not None,
+            # FIXED: reflects the actual inference device rather than always 'mps'
+            "device":                  device_str,
+            # expose run_ids so callers can verify version alignment
+            "champion_long_run_id":    self._champion_long_run_id,
+            "champion_medium_run_id":  self._champion_medium_run_id,
+            "long_artifact_run_ids":   self._long_artifact_run_ids,
+            "medium_artifact_run_ids": {str(k): v for k, v in self._medium_artifact_run_ids.items()},
         }
 
     # ============================================================
@@ -360,6 +434,9 @@ class ArtifactService:
         return self.medium_artifacts.get((str(subgroup).upper(), str(model_name).upper()))
 
     def get_short_artifact(self, promo_profile=None):
+        # NOTE: Promo_Profile (PURE_PROMO / PROMO_INFLUENCED / NORMAL) from
+        # preprocessing maps to the short-rule artifacts.  This is an intentional
+        # enterprise adaptation vs notebook's Short_SKU_Type (SHORT_PROMO / SHORT_NORMAL).
         promo_profile = str(promo_profile or "").upper()
 
         if promo_profile in {"PROMO_HEAVY", "PROMO_INFLUENCED", "PURE_PROMO"}:
@@ -373,5 +450,23 @@ class ArtifactService:
     def get_gru_long_bundle(self):
         return self.gru_bundle, self.gru_scalers
 
+    def get_short_profile_df(self):
+        """
+        Return the stored short profile dataframe from whichever
+        short artifact contains it.
+        """
+        for art in [self.short_rule_artifacts, self.short_promo_artifacts, self.short_normal_artifacts,]:
+            if isinstance(art, dict):
+                df = art.get("short_profile_df")
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    df = df.copy()
+                    df["ItemCode"] = (
+                        df["ItemCode"]
+                        .astype(str)
+                        .str.replace(r"\.0$", "", regex=True)
+                    )
+                    return df
+
+        return pd.DataFrame()
 
 artifact_service = ArtifactService()

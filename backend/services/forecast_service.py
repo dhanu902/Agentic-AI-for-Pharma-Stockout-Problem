@@ -27,7 +27,7 @@ for folder in [BACKEND_DATA_DIR, PROCESSED_DIR, OUTPUT_DIR, LOG_DIR]:
 RAW_ACTUAL_XLSX_PATH = os.path.join(RAW_DATA_DIR, "fact_monthly_closed.xlsx")
 RAW_ACTUAL_CSV_PATH = os.path.join(RAW_DATA_DIR, "fact_monthly_closed.csv")
 RAW_LIVE_CSV_PATH = os.path.join(RAW_DATA_DIR, "fact_open_month_snapshot.csv")
-FOCUS_ITEM_CODES_PATH = os.path.join(RAW_DATA_DIR, "FocusItemCodes.xlsx")
+FOCUS_ITEM_CODES_PATH = os.path.join(RAW_DATA_DIR,"Master Data","FocusItemCodes.xlsx")
 
 # ============================================================
 # PROCESSED FILES
@@ -41,6 +41,16 @@ PROCESSED_LIVE_PATH = os.path.join(PROCESSED_DIR, "processed_data_live.csv")
 FORECAST_LATEST_PATH = os.path.join(OUTPUT_DIR, "forecast_latest.csv")
 FORECAST_RUN_LOG_PATH = os.path.join(LOG_DIR, "forecast_run_log.csv")
 
+# Trend baseline forecast — budgeted SKUs NOT in the model SKU list.
+# Kept separate from forecast_latest.csv so model accuracy tracking,
+# horizon forecasting and the risk pipeline are untouched.
+TREND_FORECAST_LATEST_PATH = os.path.join(OUTPUT_DIR, "forecast_trend_latest.csv")
+TREND_FORECAST_HISTORY_PATH = os.path.join(LOG_DIR, "forecast_trend_history.csv")
+
+# Budget master — "All Budget 26 27 FY" holds ALL budgeted items
+# (including SKUs with no sales / no model forecast)
+BUDGET_XLSX_PATH = os.path.join(RAW_DATA_DIR, "Master Data", "Budget.xlsx")
+BUDGET_ALL_SHEET_NAME = "All Budget 26 27 FY"
 
 # ============================================================
 # PATH HELPERS
@@ -255,3 +265,131 @@ def get_forecast_row(item_code: str) -> Optional[dict]:
         return None
 
     return row.iloc[0].to_dict()
+
+
+# ============================================================
+# BUDGET SKU HELPER (ALL budgeted items)
+# ============================================================
+def load_budget_item_codes() -> List[str]:
+    """ItemCodes from the 'All Budget 26 27 FY' sheet — every budgeted SKU,
+    including items with no sales history and no model forecast."""
+    if not os.path.exists(BUDGET_XLSX_PATH):
+        return []
+
+    df = pd.read_excel(BUDGET_XLSX_PATH, sheet_name=BUDGET_ALL_SHEET_NAME, header=0)
+    df.columns = df.columns.astype(str).str.strip()
+
+    itemcode_col = next((c for c in ["ItemCode", "PID", "Code"] if c in df.columns), None)
+    if itemcode_col is None:
+        raise ValueError(
+            f"Budget sheet '{BUDGET_ALL_SHEET_NAME}' has no ItemCode/PID column. "
+            f"Found: {list(df.columns)}"
+        )
+
+    # Real codes are numeric -> canonical int-string. Placeholder rows for
+    # new / not-yet-coded products ("New", "Getz Pharma1", ...) are KEPT so
+    # the full budgeted list is covered (they simply get TREND_NO_HISTORY / 0
+    # in the trend output).
+    #
+    # Different products can share one placeholder label (several distinct
+    # products all coded "New") -> unmapped rows use a composite key
+    # <label>::<agency>::<product>, matching insights_engine.load_budget_lookup.
+    itemname_col = next((c for c in ["Product", "ItemName", "Name"] if c in df.columns), None)
+    agency_series = (
+        df["Agency"].ffill().astype(str).str.strip()
+        if "Agency" in df.columns else pd.Series("", index=df.index)
+    )
+    name_series = (
+        df[itemname_col].astype(str).str.strip().replace({"nan": "", "None": ""})
+        if itemname_col else pd.Series("", index=df.index)
+    )
+
+    raw = df[itemcode_col].astype(str).str.strip()
+    num = pd.to_numeric(df[itemcode_col], errors="coerce")
+    synthetic = raw + "::" + agency_series + "::" + name_series
+
+    codes = num.astype("Int64").astype(str).where(num.notna(), synthetic)
+    blank = num.isna() & raw.isin(["", "nan", "None", "NaN", "<NA>"])
+    codes = codes[~blank]
+    return sorted(codes.unique().tolist())
+
+
+# ============================================================
+# ALL-SKU FACT HISTORY (no focus filter, closed months only)
+# ============================================================
+def load_fact_history_all_skus() -> pd.DataFrame:
+    """
+    fact_monthly_closed for ALL SKUs (focus filter NOT applied), aggregated to
+    ItemCode x Year x Month_Number with Secondary_Sales_Qty.
+    Any still-open calendar month is excluded (same rule as preprocess_engine).
+    """
+    df = load_raw_data(mode="actual", apply_focus_filter=False)
+
+    # Month standardization (mirror of preprocess_engine.standardize_month_columns)
+    if "MonthNo" in df.columns and "Month_Number" not in df.columns:
+        df = df.rename(columns={"MonthNo": "Month_Number"})
+    if "Month" in df.columns and (
+        "Year" not in df.columns or "Month_Number" not in df.columns
+    ):
+        month_dt = pd.to_datetime(df["Month"], errors="coerce")
+        if "Year" not in df.columns:
+            df["Year"] = month_dt.dt.year
+        if "Month_Number" not in df.columns:
+            df["Month_Number"] = month_dt.dt.month
+
+    required = ["ItemCode", "Year", "Month_Number", "Secondary_Sales_Qty"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"fact_monthly_closed missing columns: {missing}")
+
+    df = df.copy()
+    df["ItemCode"] = (
+        df["ItemCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Month_Number"] = pd.to_numeric(df["Month_Number"], errors="coerce")
+    df = df.dropna(subset=["ItemCode", "Year", "Month_Number"])
+    df["Secondary_Sales_Qty"] = (
+        pd.to_numeric(df["Secondary_Sales_Qty"], errors="coerce").fillna(0).clip(lower=0)
+    )
+
+    # Exclude any still-open calendar month
+    now = datetime.utcnow()
+    current_period = now.year * 12 + now.month
+    period_idx = df["Year"].astype(int) * 12 + df["Month_Number"].astype(int)
+    df = df[period_idx < current_period].copy()
+
+    return (
+        df.groupby(["ItemCode", "Year", "Month_Number"], as_index=False)
+        ["Secondary_Sales_Qty"].sum()
+        .sort_values(["ItemCode", "Year", "Month_Number"])
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# TREND FORECAST OUTPUTS
+# ============================================================
+def save_trend_forecast_latest(df: pd.DataFrame) -> str:
+    df.to_csv(TREND_FORECAST_LATEST_PATH, index=False)
+    return TREND_FORECAST_LATEST_PATH
+
+
+def append_trend_forecast_history(df: pd.DataFrame) -> str:
+    if os.path.exists(TREND_FORECAST_HISTORY_PATH):
+        existing = pd.read_csv(TREND_FORECAST_HISTORY_PATH)
+        df = pd.concat([existing, df], ignore_index=True)
+    df.to_csv(TREND_FORECAST_HISTORY_PATH, index=False)
+    return TREND_FORECAST_HISTORY_PATH
+
+
+def load_trend_forecast_latest() -> pd.DataFrame:
+    if not os.path.exists(TREND_FORECAST_LATEST_PATH):
+        return pd.DataFrame()
+    return pd.read_csv(TREND_FORECAST_LATEST_PATH)
+
+
+def load_trend_forecast_history() -> pd.DataFrame:
+    if not os.path.exists(TREND_FORECAST_HISTORY_PATH):
+        return pd.DataFrame()
+    return pd.read_csv(TREND_FORECAST_HISTORY_PATH)
