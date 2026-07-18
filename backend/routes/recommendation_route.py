@@ -1,31 +1,42 @@
-# backend/routes/recommendation_route.py 
+"""
+recommendation_route.py
+=======================
+Flask blueprint. HTTP concerns only — all logic lives in the service.
+
+Registered in app.py with url_prefix="/api/recommendation", so the
+endpoint below resolves to GET /api/recommendation/results
+(same convention as /api/risk/results, /api/insights/results).
+"""
 
 from flask import Blueprint, jsonify, request
 
-from services.recommendation_service import get_recommendation_dashboard
+from services.recommendation_service import get_recommendations
 
 recommendation_bp = Blueprint("recommendation", __name__)
 
 
-@recommendation_bp.route("/", methods=["GET"])
-def home():
-    return jsonify({"message": "Recommendation routes running"}), 200
-
-
-@recommendation_bp.route("/dashboard", methods=["POST"])
-def recommendation_dashboard():
-    payload = request.get_json(silent=True) or {}
-    item_code = payload.get("item_code")
-
-    if not item_code:
+@recommendation_bp.route("/results", methods=["GET"])
+def recommendations():
+    """
+    Query params:
+        agency        (optional) filter to one AgencyName
+        min_priority  (optional) HIGH | MEDIUM
+    """
+    try:
+        result = get_recommendations(
+            agency=request.args.get("agency"),
+            min_priority=request.args.get("min_priority"),
+        )
+        # Explicit keys — a silently dropped key = empty frontend tab
         return jsonify({
-            "ok": False,
-            "error": "item_code is required"
-        }), 400
-
-    result = get_recommendation_dashboard(item_code)
-
-    if not result.get("ok"):
-        return jsonify(result), 400
-
-    return jsonify(result), 200
+            "summary": result["summary"],
+            "recommendations": result["recommendations"],
+            "all_items": result["all_items"],
+            "factor_coverage": result["factor_coverage"],
+            "kpis": result["kpis"],
+            "run_meta": result["run_meta"],
+        })
+    except NotImplementedError as e:
+        return jsonify({"error": f"data source not wired: {e}"}), 501
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

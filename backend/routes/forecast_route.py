@@ -12,6 +12,7 @@ from engines.forecast_orchestrator import (
     process_actual_raw_now,
     process_live_raw_now,
     export_forecast_latest_now,
+    export_forecast_horizon_latest_now,
     get_health,
 )
 
@@ -29,13 +30,17 @@ def dashboard():
     item_code = body.get("item_code")
 
     if not item_code:
-        return jsonify({"error": "item_code required"}), 400
+        return jsonify({"success": False, "error": "item_code required"}), 400
 
-    result = get_dashboard(item_code)
-    if result is None:
-        return jsonify({"error": "Item not found"}), 404
+    try:
+        result = get_dashboard(item_code)
+        if result is None:
+            return jsonify({"success": False, "error": "Item not found"}), 404
 
-    return jsonify(result), 200
+        return jsonify({"success": True, "data": result}), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @forecast_bp.route("/skus", methods=["GET"])
@@ -82,6 +87,12 @@ def process_live_raw():
 @forecast_bp.route("/export", methods=["POST"])
 def export_forecast():
     payload, status = export_forecast_latest_now()
+    return jsonify(payload), status
+
+
+@forecast_bp.route("/export_horizon", methods=["POST"])
+def export_forecast_horizon():
+    payload, status = export_forecast_horizon_latest_now()
     return jsonify(payload), status
 
 
