@@ -625,7 +625,7 @@ def load_budget_lookup(current_month_dt):
         fiscal_start (Timestamp | None), fiscal_end (Timestamp | None),
         month_labels (list[str]), current_month_found (bool)
     """
-    empty_sku  = pd.DataFrame(columns=["ItemCode", "Agency_Budget", "ItemName_Budget", "Budget_Qty", "Annual_Budget_Qty", "Is_Unmapped"])
+    empty_sku  = pd.DataFrame(columns=["ItemCode", "Agency_Budget", "ItemName_Budget", "Budget_Qty", "Annual_Budget_Qty", "Budget_Price", "Is_Unmapped"])
     empty_meta = {"fiscal_start": None, "fiscal_end": None, "month_labels": [], "current_month_found": False}
 
     if not os.path.exists(BUDGET_FILE):
@@ -724,6 +724,19 @@ def load_budget_lookup(current_month_dt):
         for col in month_col_map:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
 
+        # ── Budgeted unit price (BudgetPrice column) ─────────────────────────
+        price_col = next(
+            (c for c in ["BudgetPrice", "Budget_Price", "UnitPrice", "Unit_Price", "Price"]
+             if c in df.columns),
+            None,
+        )
+        df["_price"] = (
+            pd.to_numeric(df[price_col], errors="coerce").fillna(0).clip(lower=0)
+            if price_col else 0.0
+        )
+        if not price_col:
+            print(f"[INSIGHTS] Budget: no BudgetPrice column found — values will be 0. Columns: {cols}")
+
         all_month_cols = list(month_col_map.keys())
         df["_annual"] = df[all_month_cols].sum(axis=1)
 
@@ -748,6 +761,7 @@ def load_budget_lookup(current_month_dt):
                 ItemName_Budget  =("_itemname", "first"),
                 Budget_Qty       =("_current",  "sum"),
                 Annual_Budget_Qty=("_annual",   "sum"),
+                Budget_Price     =("_price",    "first"),
                 Is_Unmapped      =("_unmapped", "max"),
             )
             .rename(columns={itemcode_col: "ItemCode"})
@@ -812,6 +826,8 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
         "Possible_Achievement_%",
         "Annual_Budget_Qty", "FYTD_Sales_Qty",
         "Annual_Reach_%", "Annual_Remaining_Qty",
+        "Budget_Price", "Budget_Value", "Current_Month_Sales_Value",
+        "Annual_Budget_Value", "FYTD_Sales_Value",
         "Is_Unmapped",
     ])
 
@@ -898,6 +914,15 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
     bt["Budget_Qty"]        = pd.to_numeric(bt["Budget_Qty"],        errors="coerce").fillna(0)
     bt["Annual_Budget_Qty"] = pd.to_numeric(bt["Annual_Budget_Qty"], errors="coerce").fillna(0)
 
+    # ── Value metrics (budgeted unit price × qty) ────────────────────────────
+    # Sales values are valued AT BUDGET PRICE (no transaction price available)
+    # so budget-vs-actual value comparisons stay like-for-like.
+    bt["Budget_Price"] = pd.to_numeric(bt.get("Budget_Price"), errors="coerce").fillna(0)
+    bt["Budget_Value"]              = bt["Budget_Qty"]          * bt["Budget_Price"]
+    bt["Annual_Budget_Value"]       = bt["Annual_Budget_Qty"]   * bt["Budget_Price"]
+    bt["Current_Month_Sales_Value"] = bt["Current_Month_Sales"] * bt["Budget_Price"]
+    bt["FYTD_Sales_Value"]          = bt["FYTD_Sales_Qty"]      * bt["Budget_Price"]
+
     # ── Ratios (null-safe: never divide by 0) ────────────────────────────────
     bt["Achievement_%"] = np.where(
         bt["Budget_Qty"] > 0,
@@ -921,7 +946,9 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
     for c in ["Budget_Qty", "Current_Month_Sales", "Current_Month_Forecast",
               "Achievement_%", "Possible_Achievement_%",
               "Annual_Budget_Qty", "FYTD_Sales_Qty",
-              "Annual_Reach_%", "Annual_Remaining_Qty"]:
+              "Annual_Reach_%", "Annual_Remaining_Qty",
+              "Budget_Price", "Budget_Value", "Current_Month_Sales_Value",
+              "Annual_Budget_Value", "FYTD_Sales_Value"]:
         bt[c] = pd.to_numeric(bt[c], errors="coerce").round(2)
 
     bt = bt[list(empty.columns)].copy()
@@ -1103,11 +1130,18 @@ def build_agency_performance_table():
     total_annual_budget_qty = _fsum(budget_table, "Annual_Budget_Qty")
     total_fytd_sales_qty    = _fsum(budget_table, "FYTD_Sales_Qty")
 
+    # Value totals (budgeted unit price × qty)
+    total_budget_value         = _fsum(budget_table, "Budget_Value")
+    total_annual_budget_value  = _fsum(budget_table, "Annual_Budget_Value")
+    total_fytd_sales_value     = _fsum(budget_table, "FYTD_Sales_Value")
+    total_cur_sales_value      = _fsum(budget_table, "Current_Month_Sales_Value")
+
     agency_budget_records = []
     if not budget_table.empty:
         agency_budget_records = (
             budget_table
-            .groupby("Agency")[["Budget_Qty", "Annual_Budget_Qty", "FYTD_Sales_Qty"]]
+            .groupby("Agency")[["Budget_Qty", "Annual_Budget_Qty", "FYTD_Sales_Qty",
+                                "Budget_Value", "Annual_Budget_Value", "FYTD_Sales_Value"]]
             .sum().round(2).reset_index()
             .to_dict(orient="records")
         )
@@ -1146,6 +1180,12 @@ def build_agency_performance_table():
         "total_budget_qty":         total_budget_qty,
         "total_annual_budget_qty":  total_annual_budget_qty,
         "total_fytd_sales_qty":     total_fytd_sales_qty,
+
+        # Value totals (budgeted unit price × qty; sales valued at budget price)
+        "total_budget_value":              total_budget_value,
+        "total_annual_budget_value":       total_annual_budget_value,
+        "total_fytd_sales_value":          total_fytd_sales_value,
+        "total_current_month_sales_value": total_cur_sales_value,
         "budget_fy_months":         budget_meta.get("month_labels", []),
         "budget_current_month_found": budget_meta.get("current_month_found", False),
         "agency_budget":            agency_budget_records,
