@@ -16,9 +16,12 @@ comes from the same artifacts the other pages use:
     risk_base_snapshot.csv       M+1 physical stock basis  (Risk/Horizon)
     fact_monthly_closed          actual sales history      (all pages)
     forecast_horizon_history.csv past M+1 forecasts        (accuracy)
-    budget_analysis_latest.csv   FYTD budget vs sales      (Insights)
     License.xlsx                 import/registration expiry
-    BusinessRules.xlsx           MOQ / order multiple / max inv days
+    BusinessRules.xlsx           MOQ / multiples (no data collected yet)
+
+Budget.xlsx ("All Budget 26 27 FY") defines the PLANNER UNIVERSE only —
+budget is NOT a risk factor. Item expiry is out of scope until batch-level
+data exists (one SKU = many import batches with different expiry dates).
 
 Column names in saved CSVs can drift between runs, so loaders resolve
 columns from candidate lists (same pattern as load_budget_item_codes) and
@@ -34,7 +37,7 @@ import pandas as pd
 from engines.recommendation_engine import (
     build_recommendations,
     COL_ITEM, COL_MONTH, COL_FORECAST, COL_ACTUAL,
-    COL_TRADE_STOCK, COL_CLASS,
+    COL_TRADE_STOCK, COL_NORISK_STOCK, COL_CLASS,
     COL_IMPORT_EXPIRY, COL_REG_EXPIRY,
 )
 
@@ -50,12 +53,11 @@ from services.risk_service import (
     _normalize_itemcode,
 )
 from services.horizon_service import load_forecast_horizon_history
-from services.insights_service import BUDGET_ANALYSIS_LATEST_PATH
 
 # ============================================================
 # PATHS — licence + business rules live with the other masters
 # ============================================================
-LICENSE_XLSX_PATH = os.path.join(RAW_DATA_DIR, "Master Data", "License.xlsx")
+LICENSE_XLSX_PATH = os.path.join(RAW_DATA_DIR, "License.xlsx")
 LICENSE_SHEET = "License"
 RULES_XLSX_PATH = os.path.join(RAW_DATA_DIR, "Master Data", "BusinessRules.xlsx")
 RULES_SHEET = "Rules"
@@ -65,13 +67,18 @@ FORECAST_QTY_CANDIDATES = [
     "Forecast_Qty", "Forecast", "Forecast_Quantity", "Predicted_Qty",
     "Prediction", "Champion_Forecast_Qty", "Final_Forecast_Qty", "yhat",
 ]
-# risk_base_snapshot.csv buckets stock by expiry risk; *_Trade_Qty is the
-# sellable trade stock (matches the Trade Stock definition used by the
-# Risk/Insights pages: WH available primary + DB distributor).
+# risk_base_snapshot.csv buckets stock by expiry risk:
+#   *_Trade_Qty = *_NoRisk_Qty + *_ShortExp_Qty   (excludes Expired only;
+#   WH Inspection/Blocked stock sits outside trade entirely).
+# COVER USES NO-RISK STOCK ONLY (WH + DB NoRisk): short-expiry stock may
+# lapse before it sells, so it is not dependable cover. Trade is still
+# loaded for display, matching the Inventory page cards.
 WH_CANDIDATES = ["Primary_Trade_Qty", "WH_Stock", "WH_Qty",
                  "Available_Primary_Qty", "Warehouse_Qty", "Primary_Qty", "WH"]
 DB_CANDIDATES = ["Distributor_Trade_Qty", "DB_Stock", "DB_Qty",
                  "Distributor_Qty", "DB"]
+WH_NORISK_CANDIDATES = ["Primary_NoRisk_Qty", "WH_NoRisk_Qty", "WH_NoRisk"]
+DB_NORISK_CANDIDATES = ["Distributor_NoRisk_Qty", "DB_NoRisk_Qty", "DB_NoRisk"]
 TOTAL_STOCK_CANDIDATES = ["TradeStock", "Trade_Stock", "Trade_Stock_Qty",
                           "Total_Stock", "Total_Qty", "Physical_Stock",
                           "Opening_Stock", "Closing_Stock"]
@@ -211,6 +218,8 @@ def _load_inventory() -> pd.DataFrame:
 
     wh_col = _pick(snap, WH_CANDIDATES)
     db_col = _pick(snap, DB_CANDIDATES)
+    wh_nr_col = _pick(snap, WH_NORISK_CANDIDATES)
+    db_nr_col = _pick(snap, DB_NORISK_CANDIDATES)
     tot_col = _pick(snap, TOTAL_STOCK_CANDIDATES)
     if tot_col is None and wh_col is None and db_col is None:
         raise ValueError(
@@ -219,7 +228,7 @@ def _load_inventory() -> pd.DataFrame:
             f"Found: {list(snap.columns)}"
         )
 
-    for c in (wh_col, db_col, tot_col):
+    for c in (wh_col, db_col, wh_nr_col, db_nr_col, tot_col):
         if c:
             snap[c] = pd.to_numeric(snap[c], errors="coerce").fillna(0.0)
 
@@ -228,6 +237,10 @@ def _load_inventory() -> pd.DataFrame:
         agg["WH_Stock"] = (wh_col, "sum")
     if db_col:
         agg["DB_Stock"] = (db_col, "sum")
+    if wh_nr_col:
+        agg["WH_NoRisk"] = (wh_nr_col, "sum")
+    if db_nr_col:
+        agg["DB_NoRisk"] = (db_nr_col, "sum")
     if tot_col:
         agg[COL_TRADE_STOCK] = (tot_col, "sum")
     abc_col = _pick(snap, ABC_CANDIDATES)
@@ -240,46 +253,24 @@ def _load_inventory() -> pd.DataFrame:
     out = snap.groupby(COL_ITEM, as_index=False).agg(**agg)
     if COL_TRADE_STOCK not in out.columns:
         out[COL_TRADE_STOCK] = out.get("WH_Stock", 0.0) + out.get("DB_Stock", 0.0)
+
+    # NO-RISK stock basis for cover; fall back to trade if NoRisk missing
+    if "WH_NoRisk" in out.columns or "DB_NoRisk" in out.columns:
+        out[COL_NORISK_STOCK] = (
+            out.get("WH_NoRisk", 0.0) + out.get("DB_NoRisk", 0.0))
+    else:
+        print("[RECO] WARNING: no NoRisk columns in snapshot — "
+              "cover falls back to trade stock")
+        out[COL_NORISK_STOCK] = out[COL_TRADE_STOCK]
     return out
 
 
-def _load_budget() -> Optional[pd.DataFrame]:
-    """FYTD budget vs sales from the Insights engine output
-    (budget_analysis_latest.csv — includes zero-sales budgeted SKUs).
-
-    Returns: ItemCode, ytd_budget_qty, ytd_actual_qty — or None if the
-    insights engine hasn't been run (budget factor reports unavailable).
-    """
-    if not os.path.exists(BUDGET_ANALYSIS_LATEST_PATH):
-        print("[RECO] budget_analysis_latest.csv not found — run the "
-              "Insights engine first; budget factor unavailable")
-        return None
-
-    bdf = pd.read_csv(BUDGET_ANALYSIS_LATEST_PATH)
-    if COL_ITEM not in bdf.columns:
-        print(f"[RECO] budget analysis has no ItemCode column: {list(bdf.columns)}")
-        return None
-    # ItemCode may parse as float from CSV — canonical int-string
-    bdf[COL_ITEM] = (
-        pd.to_numeric(bdf[COL_ITEM], errors="coerce")
-        .astype("Int64").astype(str)
-    )
-    bdf = bdf[bdf[COL_ITEM] != "<NA>"]
-
-    b_col = _pick(bdf, ["Budget_Qty", "FYTD_Budget_Qty", "YTD_Budget_Qty"])
-    a_col = _pick(bdf, ["FYTD_Sales_Qty", "YTD_Sales_Qty", "FYTD_Actual_Qty"])
-    if b_col is None or a_col is None:
-        print(f"[RECO] budget analysis columns not recognised: {list(bdf.columns)}")
-        return None
-
-    out = bdf[[COL_ITEM, b_col, a_col]].rename(
-        columns={b_col: "ytd_budget_qty", a_col: "ytd_actual_qty"})
-    for c in ("ytd_budget_qty", "ytd_actual_qty"):
-        out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
-    return out.groupby(COL_ITEM, as_index=False).sum()
-
-
 def _load_license() -> Optional[pd.DataFrame]:
+
+
+    print("License path:", LICENSE_XLSX_PATH)
+    print("Exists:", os.path.exists(LICENSE_XLSX_PATH))
+
     """License.xlsx (Master Data), sheet 'License'.
     Expected: ItemCode, Import_License_Expiry, Registration_Expiry.
     Status columns are ignored — status derives from dates so it can
@@ -366,9 +357,10 @@ def _build_summary(history: pd.DataFrame, current: pd.DataFrame,
         if monthly_avg and monthly_avg > 0:
             growth_pct = round((total_forecast / monthly_avg - 1) * 100, 1)
 
-    wh = float(current["WH_Stock"].sum()) if "WH_Stock" in current.columns else None
-    db = float(current["DB_Stock"].sum()) if "DB_Stock" in current.columns else None
-    trade = float(current[COL_TRADE_STOCK].sum())
+    wh_nr = float(current["WH_NoRisk"].sum()) if "WH_NoRisk" in current.columns else None
+    db_nr = float(current["DB_NoRisk"].sum()) if "DB_NoRisk" in current.columns else None
+    no_risk = (float(current[COL_NORISK_STOCK].sum())
+               if COL_NORISK_STOCK in current.columns else None)
 
     covers = [r["cover_months"] for r in result["all_items"]
               if r["cover_months"] is not None]
@@ -377,33 +369,41 @@ def _build_summary(history: pd.DataFrame, current: pd.DataFrame,
                   else "WATCH" if median_cover is not None and median_cover < 1.5
                   else "OK")
 
+    # Licence bands: current date vs expiry — expired | <1yr RISK |
+    # 1-1.5yr ALERT | >=1.5yr safe (matches engine LICENCE_RISK/ALERT_DAYS)
     lic_summary = {"available": licence is not None}
     if licence is not None and not licence.empty:
         imp_days = (licence[COL_IMPORT_EXPIRY] - as_of).dt.days
         reg_days = (licence[COL_REG_EXPIRY] - as_of).dt.days
-        lic_summary.update({
-            "import_expired": int((imp_days < 0).sum()),
-            "import_expiring_30d": int(((imp_days >= 0) & (imp_days < 30)).sum()),
-            "import_expiring_90d": int(((imp_days >= 0) & (imp_days < 90)).sum()),
-            "registration_expired": int((reg_days < 0).sum()),
-            "registration_expiring_60d": int(((reg_days >= 0) & (reg_days < 60)).sum()),
-        })
+
+        def _bands(days):
+            return {
+                "expired": int((days < 0).sum()),
+                "risk_1y": int(((days >= 0) & (days < 365)).sum()),
+                "alert_18m": int(((days >= 365) & (days < 548)).sum()),
+                "safe": int((days >= 548).sum()),
+            }
+
+        lic_summary["import"] = _bands(imp_days)
+        lic_summary["registration"] = _bands(reg_days)
 
     if forecast_month is None:
         forecast_month = (as_of + pd.DateOffset(months=1)).strftime("%Y-%m")
 
     return {
+        # note: no "confidence" here — that value is FACTOR COVERAGE
+        # (planner-wide), not forecast accuracy; it lives on its own card
         "forecast": {
             "month": forecast_month,
             "total_forecast_qty": round(total_forecast),
             "growth_pct": growth_pct,
-            "confidence": result["factor_coverage"]["confidence"],
         },
         "inventory": {
-            "wh_stock": None if wh is None else round(wh),
-            "db_stock": None if db is None else round(db),
-            "trade_stock": round(trade),
-            "median_cover_months": median_cover,
+            # NO-RISK stock only (Trade minus short-expiry) — the cover basis
+            "wh_no_risk": None if wh_nr is None else round(wh_nr),
+            "db_no_risk": None if db_nr is None else round(db_nr),
+            "no_risk_stock": None if no_risk is None else round(no_risk),
+            "median_cover_months": median_cover,   # NO-RISK stock basis
             "status": inv_status,
         },
         "licences": lic_summary,
@@ -421,7 +421,6 @@ def get_recommendations(agency: Optional[str] = None,
 
     forecast = _load_forecast()
     inventory = _load_inventory()
-    budget = _load_budget()
     licence = _load_license()
     rules = _load_business_rules()
 
@@ -432,7 +431,33 @@ def get_recommendations(agency: Optional[str] = None,
     # Outer-ish logic: keep every SKU that has stock OR a forecast.
     current = inventory.merge(nxt, on=COL_ITEM, how="outer")
     current[COL_TRADE_STOCK] = current[COL_TRADE_STOCK].fillna(0.0)
+    current[COL_NORISK_STOCK] = current[COL_NORISK_STOCK].fillna(0.0)
     current[COL_FORECAST] = current[COL_FORECAST].fillna(0.0)
+
+    # PLANNER UNIVERSE = the FULL budgeted item list ('All Budget 26 27 FY'),
+    # exactly as the Insights page defines it — including unmapped/new
+    # products carried under synthetic composite keys (label::agency::product).
+    # LEFT JOIN from the budget list (not an intersection): a budgeted new
+    # product with no inventory/forecast row must still appear in the
+    # universe with stock 0 / forecast 0, not silently disappear.
+    try:
+        budget_codes = load_budget_item_codes()
+    except Exception as e:
+        print(f"[RECO] budget item list unavailable ({e}) — "
+              f"planner NOT scoped to budgeted SKUs")
+        budget_codes = []
+    if budget_codes:
+        before = len(current)
+        universe = pd.DataFrame({COL_ITEM: pd.unique(pd.Series(budget_codes))})
+        current = universe.merge(current, on=COL_ITEM, how="left")
+        current[COL_TRADE_STOCK] = current[COL_TRADE_STOCK].fillna(0.0)
+        current[COL_NORISK_STOCK] = current[COL_NORISK_STOCK].fillna(0.0)
+        current[COL_FORECAST] = current[COL_FORECAST].fillna(0.0)
+        history = history[history[COL_ITEM].isin(set(budget_codes))].copy()
+        n_unmapped = int(current[COL_ITEM].str.contains("::").sum())
+        print(f"[RECO] planner universe = {len(current)} budgeted SKUs "
+              f"({n_unmapped} unmapped/new-product rows; inventory∪forecast "
+              f"had {before})")
 
     if agency and "AgencyName" in current.columns:
         current = current[current["AgencyName"] == agency]
@@ -443,7 +468,6 @@ def get_recommendations(agency: Optional[str] = None,
         "items": items,
         "current": current,
         "history": history,
-        "budget": budget,
         "licence": licence,
         "rules": rules,
         "as_of": as_of,
@@ -476,7 +500,6 @@ def get_recommendations(agency: Optional[str] = None,
         "renew_licence": sum(1 for r in recs if r["action"] == "RENEW_IMPORT_LICENCE"),
         "critical": sum(1 for r in recs if r["action"] == "REORDER_URGENT"),
         "reorder_review": sum(1 for r in recs if r["action"] == "REORDER_REVIEW"),
-        "budget_blocked": sum(1 for r in recs if r["action"] == "BUDGET_BLOCKED"),
         "monitor": sum(1 for r in recs if r["action"] == "MONITOR"),
         "confidence": result["factor_coverage"]["confidence"],
     }

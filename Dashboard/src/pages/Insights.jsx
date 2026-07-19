@@ -13,6 +13,15 @@ const PAGE_SIZE = 20;
 function toNumber(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 function formatNum(v, d = 0) { return toNumber(v).toLocaleString(undefined, { maximumFractionDigits: d }); }
 function pct(v) { return toNumber(v).toFixed(1) + "%"; }
+/* Compact display for large money values: 64,471,465,913 -> 64.47B.
+   Full figure goes in the sub-line / tooltip. */
+function formatCompact(v) {
+  const n = toNumber(v);
+  if (Math.abs(n) >= 1e6) {
+    return new Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 2 }).format(n);
+  }
+  return n.toLocaleString();
+}
 function accColor(v) {
   if (v == null) return T.muted;
   const n = toNumber(v);
@@ -500,8 +509,8 @@ const tdBase = {
 };
 
 const BUDGET_COLS = [
-  "#", "Agency", "Item Code", "Item Name",
-  "Budget (Month)", "Actual Sales", "Achievement",
+  "#", "Agency", "Item Code", "Item Name", "Price",
+  "Budget (Month)", "Budget Value", "Actual Sales", "Achievement",
   "Cur Forecast", "Possible (Fcst)",
   "Annual Budget", "FYTD Sales", "Annual Progress",
 ];
@@ -653,6 +662,11 @@ export default function Insights() {
     const totalAnnualBudget = bd.reduce((s, r) => s + toNumber(r.Annual_Budget_Qty), 0);
     const totalFytdSales    = bd.reduce((s, r) => s + toNumber(r.FYTD_Sales_Qty), 0);
 
+    // Value totals (budgeted unit price x qty; sales valued at budget price)
+    const totalBudgetValue       = bd.reduce((s, r) => s + toNumber(r.Budget_Value), 0);
+    const totalAnnualBudgetValue = bd.reduce((s, r) => s + toNumber(r.Annual_Budget_Value), 0);
+    const totalFytdSalesValue    = bd.reduce((s, r) => s + toNumber(r.FYTD_Sales_Value), 0);
+
     // Aggregate gaps for the Performance KPI strip
     const budgetVsActualLoss   = Math.max(totalBudget  - totalSales, 0);
     const forecastVsActualLoss = Math.max(totalCurFcst - totalSales, 0);
@@ -675,6 +689,7 @@ export default function Insights() {
     return {
       totalSales, totalCurFcst,
       totalBudget, totalAnnualBudget, totalFytdSales,
+      totalBudgetValue, totalAnnualBudgetValue, totalFytdSalesValue,
       budgetVsActualLoss, forecastVsActualLoss,
       budgetReach, fcstVsBudget, annualReach,
       totalRaw, totalStockout, totalOther,
@@ -787,9 +802,9 @@ export default function Insights() {
       ═════════════════════════════════════════════════════════= */}
       <SectionLabel accent={T.blue}>Performance — {agency || "All Agencies"}</SectionLabel>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20 }}>
-        <Kpi glyph="▦" delay={0}   label="Budget (Month)"     value={formatNum(kpi.totalBudget)}  color={T.purple} sub="All budgeted items" />
-        <Kpi glyph="◧" delay={40}  label="Actual Sales (Qty)" value={formatNum(kpi.totalSales)}   color={T.sky} />
-        <Kpi glyph="◔" delay={80}  label="Current Forecast"   value={formatNum(kpi.totalCurFcst)} color={T.amber} />
+        <Kpi glyph="▦" delay={0}   label="Budget (Month QTY)"     value={formatNum(kpi.totalBudget)}  color={T.purple} sub="All budgeted items" />
+        <Kpi glyph="◧" delay={40}  label="Actual Sales (QTY)" value={formatNum(kpi.totalSales)}   color={T.sky} />
+        <Kpi glyph="◔" delay={80}  label="Current Forecast (QTY)"   value={formatNum(kpi.totalCurFcst)} color={T.amber} />
         <Kpi glyph="▼" delay={120} label="Loss — Budget vs Actual"
           value={kpi.budgetVsActualLoss > 0 ? formatNum(kpi.budgetVsActualLoss) : "—"}
           color={kpi.budgetVsActualLoss > 0 ? T.red : T.green}
@@ -806,8 +821,9 @@ export default function Insights() {
       <SectionLabel accent={T.purple}>Budget — {agency || "All Agencies"}
         {meta?.current_month_label && <span style={{ marginLeft: 6, fontWeight: 900 }}>({meta.current_month_label})</span>}
       </SectionLabel>
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 22 }}>
-        <Kpi glyph="◆" delay={0} label={`Annual Budget ${agency ? `— ${agency}` : "(All)"}`}
+      {/* Row A — quantities + reach gauges */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+        <Kpi glyph="◆" delay={0} label={`Annual Budget ${agency ? `— ${agency}` : ""}`}
           value={formatNum(kpi.totalAnnualBudget)}
           color={T.purple}
           sub="Full FY planned units" />
@@ -828,6 +844,24 @@ export default function Insights() {
         <RatioKpi delay={160} label="Forecast / Budget"
           value={kpi.fcstVsBudget}
           sub="Forecast alignment" />
+      </div>
+
+      {/* Row B — value (budgeted unit price × qty); compact display, full figure in sub */}
+      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 22 }}>
+        <Kpi glyph="＄" delay={60} label="Annual Budget Value"
+          value={<span title={formatNum(kpi.totalAnnualBudgetValue)}>{formatCompact(kpi.totalAnnualBudgetValue)}</span>}
+          color={T.indigo || T.purple}
+          sub={`${formatNum(kpi.totalAnnualBudgetValue)} · at budget price`} />
+
+        <Kpi glyph="＄" delay={90} label="Budget Value (Month)"
+          value={<span title={formatNum(kpi.totalBudgetValue)}>{formatCompact(kpi.totalBudgetValue)}</span>}
+          color={T.purple}
+          sub={`${formatNum(kpi.totalBudgetValue)} · ${meta?.current_month_label || "current month"}`} />
+
+        <Kpi glyph="＄" delay={120} label="FYTD Sales Value"
+          value={<span title={formatNum(kpi.totalFytdSalesValue)}>{formatCompact(kpi.totalFytdSalesValue)}</span>}
+          color={T.teal}
+          sub={`${formatNum(kpi.totalFytdSalesValue)} · at budget price`} />
       </div>
 
       {/* ══════════════════════════════════════════════════════════
@@ -902,6 +936,7 @@ export default function Insights() {
             {activeTab === "budget" ? (
               <>
                 <SortBtn col="Budget_Qty"             label="Budget"       sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
+                <SortBtn col="Budget_Value"           label="Value"        sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Achievement_%"          label="Achievement"  sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Possible_Achievement_%" label="Possible"     sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Annual_Budget_Qty"      label="Annual"       sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
@@ -953,7 +988,9 @@ export default function Insights() {
                       {Array.from({ length: 4 }).map((_, i) => (
                         <th key={i} style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
                       ))}
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>Budgeted unit</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Cur month plan</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Qty × price</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Actual secondary</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Actual / Budget</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>M+1 from history</th>
@@ -968,6 +1005,8 @@ export default function Insights() {
                       const rowNum  = agency ? idx + 1 : (budgetPage - 1) * PAGE_SIZE + idx + 1;
                       const bg      = idx % 2 === 0 ? T.card : T.surface + "66";
                       const budget  = toNumber(r.Budget_Qty);
+                      const price   = toNumber(r.Budget_Price);
+                      const bValue  = toNumber(r.Budget_Value);
                       const annual  = toNumber(r.Annual_Budget_Qty);
                       const ach     = r["Achievement_%"];
                       const poss    = r["Possible_Achievement_%"];
@@ -982,8 +1021,14 @@ export default function Insights() {
                           <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, fontFamily: FONT_UI }}>{r.Agency || "—"}</td>
                           <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
                           <td style={{ ...tdBase, background: bg, color: T.text, minWidth: 200, fontFamily: FONT_UI, fontWeight: 500 }}>{r.ItemName || "—"}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right" }}>
+                            {price > 0 ? formatNum(price, 2) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                          </td>
                           <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, textAlign: "right" }}>
                             {budget > 0 ? formatNum(budget) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                          </td>
+                          <td style={{ ...tdBase, background: bg, color: T.purple, textAlign: "right" }}>
+                            {bValue > 0 ? formatNum(bValue) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
                           </td>
                           <td style={{ ...tdBase, background: bg, color: T.sky, fontWeight: 800, textAlign: "right" }}>
                             {formatNum(r.Current_Month_Sales)}

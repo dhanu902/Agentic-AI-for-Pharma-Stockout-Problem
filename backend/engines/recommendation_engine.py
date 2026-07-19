@@ -8,8 +8,7 @@ AI PLANNER — final decision layer of the pipeline:
     Forecast Engine -> Risk Engine -> Inventory Projection
                                           |
                                    Recommendation Service
-                                   (loads: forecast, inventory, budget,
-                                    licence, business rules)
+                                   (loads: forecast, inventory, licence)
                                           |
                                    THIS ENGINE
                                    (reasoning + decision only —
@@ -25,20 +24,25 @@ FACTOR REGISTRY — every out-of-stock factor is a pluggable scorer:
     - reasons    : list[str] reason codes
     - available  : bool, False when the underlying data is not collected yet
 
-Live today : cover, forecast_trust, budget, licence (License.xlsx)
-Stubs      : po_pipeline, grn_reliability, item_expiry
+Live today : cover (NO-RISK stock), forecast_trust, licence (License.xlsx)
+Pending    : po_pipeline, grn_reliability (data not collected yet)
+
+Removed by design decision (not stubs — fully out of scope for now):
+    budget      — not considered as a stockout factor
+    item_expiry — batch-wise expiry (one SKU = many import batches, each
+                  with its own mfg/expiry); needs batch-level data
 
 DECISION LOGIC (two layers):
 1) Weighted risk score over available factors (renormalised weights).
 2) GATING RULES that override the score — they distinguish WHY procurement
    cannot proceed instead of just inflating risk:
      registration expired                     -> STOP_PROCUREMENT (CRITICAL)
-     import licence lapsing + stock needed    -> RENEW_IMPORT_LICENCE
-     replenishment unfundable                 -> BUDGET_BLOCKED
+     import licence in RISK band + stock need -> RENEW_IMPORT_LICENCE
      cover < 0.5 months                       -> REORDER_URGENT (hard floor)
 
-BUSINESS RULES (optional `rules` input): MOQ, order multiple, max inventory
-days shape gap_qty into an orderable suggested_qty.
+BUSINESS RULES (optional `rules` input; no data collected yet so usually
+None): MOQ / order multiple / max inventory days shape gap_qty into an
+orderable suggested_qty. Without rules, suggested_qty = gap_qty.
 """
 
 import numpy as np
@@ -51,12 +55,13 @@ COL_ITEM = "ItemCode"
 COL_MONTH = "Month"              # datetime64, month start
 COL_FORECAST = "Forecast"
 COL_ACTUAL = "Actual"
-COL_TRADE_STOCK = "TradeStock"   # WH available primary + DB distributor
+COL_TRADE_STOCK = "TradeStock"   # WH trade + DB trade (NoRisk + ShortExp)
+COL_NORISK_STOCK = "NoRiskStock" # WH NoRisk + DB NoRisk — COVER USES THIS
 COL_CLASS = "ABC_Class"
 # License.xlsx (sheet "License")
 COL_IMPORT_EXPIRY = "Import_License_Expiry"
 COL_REG_EXPIRY = "Registration_Expiry"
-# Business rules
+# Business rules (no data yet)
 COL_MOQ = "MOQ"
 COL_ORDER_MULTIPLE = "OrderMultiple"
 COL_MAX_INV_DAYS = "MaxInventoryDays"
@@ -73,27 +78,25 @@ MAX_DEMAND_UPLIFT = 0.50
 BIAS_LOOKBACK_MONTHS = 6
 MIN_BIAS_MONTHS = 3
 
-BUDGET_OVERRUN_ALERT = 0.10
+# Licence bands (current date vs expiry date; applies to BOTH the import
+# licence and the product registration). Pharma licence renewal is a long
+# regulatory process, so the horizon is measured in months, not days:
+#   expired            -> score 100 (critical)
+#   < 1 year   (RISK)  -> score ramps 80 -> 100 as expiry approaches
+#   < 1.5 yrs  (ALERT) -> score 40 (start the renewal paperwork)
+#   >= 1.5 yrs (SAFE)  -> score 0, but months/years left still reported
+LICENCE_RISK_DAYS = 365
+LICENCE_ALERT_DAYS = 548          # ~1.5 years
+LICENCE_GATE_DAYS = LICENCE_RISK_DAYS
 
-# Licence scoring bands (days remaining -> score).
-# Import licence: expired or <30d = 100, 30-60 = 60, 60-90 = 30, >90 = 0.
-# Registration:   expired = 100, <30d = 80, 30-60 = 40, healthy = 0.
-IMPORT_BANDS = [(30, 100.0), (60, 60.0), (90, 30.0)]
-REG_BANDS = [(0, 100.0), (30, 80.0), (60, 40.0)]
-
-# Gating: import licence expiring within this window while stock is needed
-# -> renewing the licence IS the stockout-prevention action, not a PO.
-LICENCE_GATE_DAYS = 30
-
-# 7-factor weight design (sums to 1.0). Renormalised over available factors.
+# 5-factor weight design (sums to 1.0). Renormalised over available factors.
+# Live today: cover + forecast_trust + licence = 0.80 covered.
 FACTOR_WEIGHTS = {
-    "cover": 0.35,
-    "forecast_trust": 0.10,
-    "budget": 0.15,
-    "licence": 0.10,
+    "cover": 0.45,
+    "forecast_trust": 0.15,
+    "licence": 0.20,
     "po_pipeline": 0.15,
     "grn_reliability": 0.05,
-    "item_expiry": 0.10,
 }
 
 CONFIDENCE_BANDS = [(0.80, "HIGH"), (0.50, "MEDIUM"), (0.0, "LOW")]
@@ -136,8 +139,6 @@ def score_forecast_trust(inputs: dict) -> pd.DataFrame:
     items = inputs["items"][COL_ITEM]
     if hist is None or hist.empty:
         return _empty_scores(items)
-    # history may carry actuals only (no recoverable past forecasts yet):
-    # bias/wmape would be meaningless zeros -> report unavailable instead
     if COL_FORECAST not in hist.columns or hist[COL_FORECAST].isna().all():
         return _empty_scores(items)
 
@@ -177,17 +178,25 @@ def score_forecast_trust(inputs: dict) -> pd.DataFrame:
 
 def score_cover(inputs: dict) -> pd.DataFrame:
     """
-    Months of cover — consumes upstream numbers, never recomputes them.
+    Months of cover — computed on NO-RISK STOCK ONLY (WH NoRisk + DB
+    NoRisk). Short-expiry stock is deliberately excluded: it may lapse
+    before it sells, so it is not dependable cover. Falls back to trade
+    stock only when the snapshot carries no NoRisk columns.
+
         effective_demand = forecast_M+1 * (1 + demand_uplift)
-        cover_months     = trade_stock / effective_demand
+        cover_months     = no_risk_stock / effective_demand
         score            = clip(100 * (1 - cover/target), 0, 100)
-        gap_qty          = max(0, target * effective_demand - trade_stock)
+        gap_qty          = max(0, target * effective_demand - no_risk_stock)
+
     Targets: A=2.0, B=1.5, C=1.0 months.
     """
     cur = inputs["current"]
     trust = inputs.get("forecast_trust")
 
     d = cur.copy()
+    stock_col = COL_NORISK_STOCK if COL_NORISK_STOCK in d.columns else COL_TRADE_STOCK
+    d["__stock__"] = pd.to_numeric(d[stock_col], errors="coerce").fillna(0.0)
+
     uplift = (
         trust.set_index(COL_ITEM)["demand_uplift"]
         if trust is not None and "demand_uplift" in trust.columns
@@ -198,7 +207,7 @@ def score_cover(inputs: dict) -> pd.DataFrame:
     d["target_cover"] = d[COL_CLASS].map(_target_cover) if COL_CLASS in d.columns \
         else DEFAULT_TARGET_COVER
     d["cover_months"] = np.where(
-        d["effective_demand"] > 0, d[COL_TRADE_STOCK] / d["effective_demand"], np.inf,
+        d["effective_demand"] > 0, d["__stock__"] / d["effective_demand"], np.inf,
     )
     d["score"] = np.where(
         np.isfinite(d["cover_months"]),
@@ -206,8 +215,9 @@ def score_cover(inputs: dict) -> pd.DataFrame:
         0.0,
     )
     d["gap_qty"] = np.clip(
-        d["target_cover"] * d["effective_demand"] - d[COL_TRADE_STOCK], 0, None
+        d["target_cover"] * d["effective_demand"] - d["__stock__"], 0, None
     ).round(0)
+    d["no_risk_stock"] = d["__stock__"]
 
     def _reasons(r):
         out = []
@@ -225,68 +235,43 @@ def score_cover(inputs: dict) -> pd.DataFrame:
 
     d["reasons"] = d.apply(_reasons, axis=1)
     d["available"] = True
-    return d[[COL_ITEM, "score", "reasons", "available",
-              "cover_months", "effective_demand", "gap_qty", "target_cover"]]
+    return d[[COL_ITEM, "score", "reasons", "available", "cover_months",
+              "effective_demand", "gap_qty", "target_cover", "no_risk_stock"]]
 
 
-def score_budget(inputs: dict) -> pd.DataFrame:
-    """
-    Budget: overrun ramp (10% over -> 20 pts, 50%+ -> 100) plus a
-    budget_blocked flag when est_gap_value > remaining FY budget.
-    """
-    b = inputs["budget"]
-    items = inputs["items"][COL_ITEM]
-    if b is None or b.empty:
-        return _empty_scores(items)
+def _licence_band_score(days: pd.Series) -> pd.Series:
+    """days remaining -> score. Expired 100; RISK band ramps 80->100 as
+    expiry approaches; ALERT band 40; SAFE 0. NaN (no date) -> 0."""
+    frac = np.clip(days / LICENCE_RISK_DAYS, 0, 1)
+    risk_ramp = 80.0 + 20.0 * (1.0 - frac)
+    return pd.Series(np.select(
+        [days.isna(), days < 0, days < LICENCE_RISK_DAYS, days < LICENCE_ALERT_DAYS],
+        [0.0, 100.0, risk_ramp, 40.0],
+        default=0.0,
+    ), index=days.index)
 
-    d = b.copy()
-    d["overrun"] = np.where(
-        d["ytd_budget_qty"] > 0,
-        (d["ytd_actual_qty"] - d["ytd_budget_qty"]) / d["ytd_budget_qty"], 0.0,
-    )
-    d["score"] = np.clip(100.0 * np.clip(d["overrun"], 0, None) / 0.5, 0, 100)
 
-    has_val = {"fy_budget_val", "ytd_actual_val", "est_gap_value"}.issubset(d.columns)
-    if has_val:
-        d["remaining_budget_val"] = d["fy_budget_val"] - d["ytd_actual_val"]
-        d["budget_blocked"] = d["est_gap_value"] > d["remaining_budget_val"]
-    else:
-        d["budget_blocked"] = False
-
-    def _reasons(r):
-        out = []
-        if r["overrun"] > BUDGET_OVERRUN_ALERT:
-            out.append(f"BUDGET_OVERRUN_{r['overrun']:.0%}")
-        if r["budget_blocked"]:
-            out.append("BUDGET_BLOCKED")
-        return out
-
-    d["reasons"] = d.apply(_reasons, axis=1)
-    d["available"] = True
-    keep = [COL_ITEM, "score", "reasons", "available", "budget_blocked"]
-    out = items.to_frame().merge(d[keep], on=COL_ITEM, how="left")
-    out["score"] = out["score"].fillna(0.0)
-    out["available"] = out["available"].fillna(True)
-    out["budget_blocked"] = out["budget_blocked"].fillna(False)
-    out["reasons"] = out["reasons"].apply(lambda v: v if isinstance(v, list) else [])
-    return out
+def _months_left(days) -> int:
+    return int(round(days / 30.44))
 
 
 def score_licence(inputs: dict) -> pd.DataFrame:
     """
-    Licence factor (import licence + product registration from License.xlsx).
+    Licence factor — CURRENT DATE vs expiry date (RegLicense /
+    ImportLicense in License.xlsx), same bands for both licences:
 
-    Scoring bands on days remaining (as of `as_of`, default today):
-        Import  : expired/<30d = 100 | 30-60 = 60 | 60-90 = 30 | >90 = 0
-        Registr.: expired = 100 | <30d = 80 | 30-60 = 40 | healthy = 0
+        expired          -> 100  ..._EXPIRED
+        < 1 year   RISK  -> 80..100 (ramp)  ..._RISK_{n}MO
+        < 1.5 yrs  ALERT -> 40   ..._ALERT_{n}MO
+        >= 1.5 yrs SAFE  -> 0    (no reason; months left still reported
+                                  via import_days / reg_days for the UI)
+
         factor score = max(import_score, registration_score)
 
-    Also emits GATING columns consumed by the action layer:
+    GATING columns consumed by the action layer:
         reg_expired  : registration lapsed -> STOP_PROCUREMENT
-        import_gate  : import licence expires < LICENCE_GATE_DAYS ->
+        import_gate  : import licence inside RISK band (< 1 year) ->
                        RENEW_IMPORT_LICENCE when stock is also needed
-    Gating is separate from the score on purpose: an expiring licence must
-    CHANGE THE ACTION, not just nudge a number.
     """
     lic = inputs.get("licence")
     items = inputs["items"][COL_ITEM]
@@ -299,34 +284,27 @@ def score_licence(inputs: dict) -> pd.DataFrame:
     d["reg_days"] = (pd.to_datetime(d[COL_REG_EXPIRY], errors="coerce") - as_of).dt.days
 
     imp = d["import_days"]
-    d["import_score"] = np.select(
-        [imp.isna(), imp < IMPORT_BANDS[0][0], imp <= IMPORT_BANDS[1][0], imp <= IMPORT_BANDS[2][0]],
-        [0.0, IMPORT_BANDS[0][1], IMPORT_BANDS[1][1], IMPORT_BANDS[2][1]],
-        default=0.0,
-    )
     reg = d["reg_days"]
-    d["reg_score"] = np.select(
-        [reg.isna(), reg < REG_BANDS[0][0], reg < REG_BANDS[1][0], reg <= REG_BANDS[2][0]],
-        [0.0, REG_BANDS[0][1], REG_BANDS[1][1], REG_BANDS[2][1]],
-        default=0.0,
-    )
+    d["import_score"] = _licence_band_score(imp)
+    d["reg_score"] = _licence_band_score(reg)
     d["score"] = np.maximum(d["import_score"], d["reg_score"])
     d["reg_expired"] = reg.notna() & (reg < 0)
     d["import_gate"] = imp.notna() & (imp < LICENCE_GATE_DAYS)
 
+    def _lic_reasons(prefix, days):
+        if pd.isna(days):
+            return []
+        if days < 0:
+            return [f"{prefix}_EXPIRED"]
+        if days < LICENCE_RISK_DAYS:
+            return [f"{prefix}_RISK_{_months_left(days)}MO"]
+        if days < LICENCE_ALERT_DAYS:
+            return [f"{prefix}_ALERT_{_months_left(days)}MO"]
+        return []
+
     def _reasons(r):
-        out = []
-        if pd.notna(r["import_days"]):
-            if r["import_days"] < 0:
-                out.append("IMPORT_LICENSE_EXPIRED")
-            elif r["import_days"] <= 90 and r["import_score"] > 0:
-                out.append(f"IMPORT_LICENSE_EXPIRING_{int(r['import_days'])}D")
-        if pd.notna(r["reg_days"]):
-            if r["reg_days"] < 0:
-                out.append("PRODUCT_REGISTRATION_EXPIRED")
-            elif r["reg_score"] > 0:
-                out.append(f"PRODUCT_REGISTRATION_EXPIRING_{int(r['reg_days'])}D")
-        return out
+        return (_lic_reasons("IMPORT_LICENSE", r["import_days"])
+                + _lic_reasons("PRODUCT_REGISTRATION", r["reg_days"]))
 
     d["reasons"] = d.apply(_reasons, axis=1)
     d["available"] = True
@@ -342,24 +320,18 @@ def score_licence(inputs: dict) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Stubs — implement when data collection starts
+# Pending factors — data not collected yet
 # ---------------------------------------------------------------------------
 
 def score_po_pipeline(inputs: dict) -> pd.DataFrame:
-    """Factor: POs — STUB. Planned: time-phase open PO qty into projected
-    cover; PO past confirmed ETA without GRN -> LATE_SUPPLY."""
+    """Factor: POs — PENDING (no data). Planned: time-phase open PO qty
+    into projected cover; PO past confirmed ETA without GRN -> LATE_SUPPLY."""
     return _empty_scores(inputs["items"][COL_ITEM])
 
 
 def score_grn_reliability(inputs: dict) -> pd.DataFrame:
-    """Factor: GRNs — STUB. Planned: realised lead-time stats
-    (mean, p90, late rate) per vendor/SKU from PO->GRN deltas."""
-    return _empty_scores(inputs["items"][COL_ITEM])
-
-
-def score_item_expiry(inputs: dict) -> pd.DataFrame:
-    """Factor: batch expiry — STUB. Planned: FEFO effective-available;
-    stock expiring before it can sell is excluded from cover."""
+    """Factor: GRN / supplier reliability — PENDING (no data). Planned:
+    realised lead-time stats (mean, p90, late rate) from PO->GRN deltas."""
     return _empty_scores(inputs["items"][COL_ITEM])
 
 
@@ -369,28 +341,22 @@ def score_item_expiry(inputs: dict) -> pd.DataFrame:
 FACTOR_REGISTRY = {
     "forecast_trust": score_forecast_trust,   # runs first: cover consumes uplift
     "cover": score_cover,
-    "budget": score_budget,
     "licence": score_licence,
     "po_pipeline": score_po_pipeline,
     "grn_reliability": score_grn_reliability,
-    "item_expiry": score_item_expiry,
 }
 
 
 # ---------------------------------------------------------------------------
-# Business rules -> suggested order qty
+# Business rules -> suggested order qty (no data yet -> passthrough)
 # ---------------------------------------------------------------------------
 
 def _apply_business_rules(agg: pd.DataFrame, rules) -> pd.DataFrame:
     """
-    Shape gap_qty into an orderable suggested_qty:
-        1. floor at MOQ                      (reason MOQ_APPLIED)
-        2. round UP to order multiple        (reason ORDER_MULTIPLE_APPLIED)
-        3. cap so stock after order <= effective_demand * max_inv_days/30
-           (reason CAPPED_MAX_INVENTORY_DAYS; guards expiry exposure)
-    Cap conflicts (cap < MOQ) emit RULE_CONFLICT_MOQ_VS_MAX_DAYS and keep
-    the cap — over-stocking pharma past max days is the worse failure.
-    Without a rules table, suggested_qty = gap_qty.
+    Shape gap_qty into an orderable suggested_qty (MOQ floor, order-multiple
+    round-up, max-inventory-days cap on the NO-RISK stock basis). MOQ /
+    supplier data is not collected yet, so `rules` is normally None and
+    suggested_qty = gap_qty.
     """
     a = agg.copy()
     if rules is None or (hasattr(rules, "empty") and rules.empty):
@@ -407,7 +373,7 @@ def _apply_business_rules(agg: pd.DataFrame, rules) -> pd.DataFrame:
     sug, rule_reasons = [], []
     for q, m, ml, md, dem, stock in zip(
         qty, moq, mult, max_days, a["effective_demand"].fillna(0.0),
-        a.get("trade_stock", pd.Series(np.nan, index=a.index)).fillna(np.nan),
+        a.get("no_risk_stock", pd.Series(np.nan, index=a.index)).fillna(np.nan),
     ):
         reasons = []
         if q <= 0:
@@ -453,22 +419,15 @@ def _needs_stock(row) -> bool:
 
 
 def _action(row) -> str:
-    """Gating order matters — it encodes WHY procurement cannot proceed:
-    1. Registration expired: selling/importing is illegal. STOP_PROCUREMENT,
-       escalate regulatory — ordering stock now is the worst possible move.
-    2. Import licence lapsing while stock is needed: the PO would arrive
-       against a dead licence. The stockout-prevention action IS the
-       licence renewal, so RENEW_IMPORT_LICENCE, not 'place PO'.
-    3. Unfundable replenishment: BUDGET_BLOCKED.
-    4. Then the score ladder with the cover<0.5 hard floor."""
+    """Gating order encodes WHY procurement cannot proceed:
+    1. Registration expired -> STOP_PROCUREMENT (ordering is illegal).
+    2. Import licence in RISK band + stock needed -> RENEW_IMPORT_LICENCE
+       (the renewal IS the stockout-prevention action, not a PO).
+    3. Score ladder with the cover<0.5 hard floor."""
     if row.get("reg_expired", False):
         return "STOP_PROCUREMENT"
     if row.get("import_gate", False) and _needs_stock(row):
         return "RENEW_IMPORT_LICENCE"
-    if row.get("budget_blocked", False) and (
-        row["risk_score"] >= SCORE_MONITOR or _cover_critical(row)
-    ):
-        return "BUDGET_BLOCKED"
     if row["risk_score"] >= SCORE_CRITICAL or _cover_critical(row):
         return "REORDER_URGENT"
     if row["risk_score"] >= SCORE_REORDER:
@@ -486,9 +445,6 @@ def _priority(row) -> str:
         return "HIGH"
     if row["risk_score"] >= SCORE_REORDER:
         return "MEDIUM"
-    # an unfundable replenishment need is never a LOW-priority situation
-    if row.get("budget_blocked", False) and _needs_stock(row):
-        return "MEDIUM"
     return "LOW"
 
 
@@ -496,9 +452,9 @@ def build_recommendations(inputs: dict) -> dict:
     """
     Entry point. inputs:
         items    : DataFrame[ItemCode, ABC_Class, ...]  (universe)
-        current  : DataFrame[ItemCode, TradeStock, Forecast(M+1), ABC_Class]
+        current  : DataFrame[ItemCode, NoRiskStock, TradeStock,
+                             Forecast(M+1), ABC_Class]
         history  : DataFrame[ItemCode, Month, Forecast, Actual] (closed)
-        budget   : DataFrame[ItemCode, ytd_budget_qty, ytd_actual_qty, ...]
         licence  : DataFrame[ItemCode, Import_License_Expiry,
                              Registration_Expiry]              (or None)
         rules    : DataFrame[ItemCode, MOQ, OrderMultiple,
@@ -544,25 +500,22 @@ def build_recommendations(inputs: dict) -> dict:
     )
     agg["reasons"] = agg[COL_ITEM].map(all_reasons)
 
-    # detail columns: cover, budget, licence
+    # detail columns: cover + licence
     cover = factor_results["cover"]
     agg = agg.merge(
-        cover[[COL_ITEM, "cover_months", "effective_demand", "gap_qty", "target_cover"]],
+        cover[[COL_ITEM, "cover_months", "effective_demand", "gap_qty",
+               "target_cover", "no_risk_stock"]],
         on=COL_ITEM, how="left",
     )
-    # trade stock for the max-days cap
-    agg = agg.merge(
-        inputs["current"][[COL_ITEM, COL_TRADE_STOCK]].rename(
-            columns={COL_TRADE_STOCK: "trade_stock"}),
-        on=COL_ITEM, how="left",
-    )
-
-    budget = factor_results["budget"]
-    if "budget_blocked" in budget.columns:
-        agg = agg.merge(budget[[COL_ITEM, "budget_blocked"]], on=COL_ITEM, how="left")
-        agg["budget_blocked"] = agg["budget_blocked"].fillna(False)
+    # trade stock kept for display alongside the no-risk basis
+    if COL_TRADE_STOCK in inputs["current"].columns:
+        agg = agg.merge(
+            inputs["current"][[COL_ITEM, COL_TRADE_STOCK]].rename(
+                columns={COL_TRADE_STOCK: "trade_stock"}),
+            on=COL_ITEM, how="left",
+        )
     else:
-        agg["budget_blocked"] = False
+        agg["trade_stock"] = np.nan
 
     lic = factor_results["licence"]
     lic_cols = ["import_days", "reg_days", "reg_expired", "import_gate"]
@@ -576,7 +529,7 @@ def build_recommendations(inputs: dict) -> dict:
         agg["reg_expired"] = False
         agg["import_gate"] = False
 
-    # business rules -> suggested_qty
+    # business rules -> suggested_qty (passthrough while no rules data)
     agg = _apply_business_rules(agg, inputs.get("rules"))
     agg["reasons"] = [
         base + extra for base, extra in zip(agg["reasons"], agg["rule_reasons"])
@@ -595,6 +548,8 @@ def build_recommendations(inputs: dict) -> dict:
     agg["cover_months"] = agg["cover_months"].replace(np.inf, None)
     for c in ("import_days", "reg_days"):
         agg[c] = agg[c].astype(object).where(agg[c].notna(), None)
+    agg["trade_stock"] = agg["trade_stock"].astype(object).where(
+        agg["trade_stock"].notna(), None)
 
     prio_rank = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
     agg["__prio__"] = agg["priority"].map(prio_rank)
@@ -606,7 +561,7 @@ def build_recommendations(inputs: dict) -> dict:
 
     cols = [COL_ITEM, "risk_score", "action", "priority", "confidence",
             "cover_months", "effective_demand", "gap_qty", "suggested_qty",
-            "target_cover", "trade_stock", "budget_blocked",
+            "target_cover", "no_risk_stock", "trade_stock",
             "import_days", "reg_days", "reasons"]
     return {
         "recommendations": recs[cols].to_dict(orient="records"),

@@ -165,3 +165,22 @@ curl http://127.0.0.1:5001/api/forecast/health
 1. Load Month-End Data
 2. Generate Forecast File
 3. Generate Horizon Forecast
+
+Memo:
+Inventory excel file -> Month column -> npt same column extracted from DB. if Last monthend
+
+
+Recommendation Page
+
+. Splits into two layers that deliberately do different jobs:
+    Layer 1 - a weighted risk score (0–100) 
+            - answers "how worried should we be about this SKU stocking out?" 
+            - It's a continuous number, good for ranking.
+    Layer 2 — gating rules answer "why can't procurement proceed, and what's the actual next action?" 
+            - These override the score, 
+            - because an expired registration isn't "high risk" — it's a categorically different situation where placing a PO would be the wrong move entirely.
+
+Layer 1: The factor registry and risk score
+Layer 2: The gating ladder
+
+

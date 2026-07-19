@@ -56,6 +56,9 @@ def run_agency_performance_engine() -> dict:
             "total_budget_qty": meta.get("total_budget_qty"),
             "total_annual_budget_qty": meta.get("total_annual_budget_qty"),
             "total_fytd_sales_qty": meta.get("total_fytd_sales_qty"),
+            "total_budget_value": meta.get("total_budget_value"),
+            "total_annual_budget_value": meta.get("total_annual_budget_value"),
+            "total_fytd_sales_value": meta.get("total_fytd_sales_value"),
 
             # Loss
             "total_raw_loss_qty": meta.get("total_raw_loss_qty"),
@@ -207,9 +210,12 @@ def _load_meta(df: pd.DataFrame) -> dict:
             bdf = pd.read_csv(BUDGET_ANALYSIS_LATEST_PATH)
             meta["budget_item_count"] = int(len(bdf))
             for src, key in [
-                ("Budget_Qty",        "total_budget_qty"),
-                ("Annual_Budget_Qty", "total_annual_budget_qty"),
-                ("FYTD_Sales_Qty",    "total_fytd_sales_qty"),
+                ("Budget_Qty",          "total_budget_qty"),
+                ("Annual_Budget_Qty",   "total_annual_budget_qty"),
+                ("FYTD_Sales_Qty",      "total_fytd_sales_qty"),
+                ("Budget_Value",        "total_budget_value"),
+                ("Annual_Budget_Value", "total_annual_budget_value"),
+                ("FYTD_Sales_Value",    "total_fytd_sales_value"),
             ]:
                 if src in bdf.columns:
                     meta[key] = float(

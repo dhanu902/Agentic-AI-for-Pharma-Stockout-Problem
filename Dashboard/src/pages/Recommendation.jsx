@@ -39,7 +39,6 @@ const ACTION_META = {
   RENEW_IMPORT_LICENCE: { label: "Renew Import Licence", color: T.amber },
   REORDER_URGENT:       { label: "Reorder Urgent",       color: T.red },
   REORDER_REVIEW:       { label: "Reorder Review",       color: T.amber },
-  BUDGET_BLOCKED:       { label: "Budget Blocked",       color: T.purple },
   MONITOR:              { label: "Monitor",              color: T.blue },
   OK:                   { label: "OK",                   color: T.muted },
 };
@@ -49,24 +48,25 @@ const TABS = [
   { key: "LICENCE",         label: "Licence / Regulatory", accent: T.purple },
   { key: "REORDER_URGENT",  label: "Urgent",              accent: T.red },
   { key: "REORDER_REVIEW",  label: "Reorder Review",      accent: T.amber },
-  { key: "BUDGET_BLOCKED",  label: "Budget Blocked",      accent: T.purple },
   { key: "MONITOR",         label: "Monitor",             accent: T.blue },
 ];
 const CONFIDENCE_COLOR = { HIGH: T.green, MEDIUM: T.amber, LOW: T.red };
 const PRIORITY_COLOR = (p) =>
   p === "CRITICAL" || p === "HIGH" ? T.red : p === "MEDIUM" ? T.amber : T.muted;
+// 5-factor design: budget & item expiry removed by design decision
 const FACTOR_LABELS = {
-  cover: "Cover", forecast_trust: "Forecast Trust", budget: "Budget",
+  cover: "Cover (No-Risk)", forecast_trust: "Forecast Trust",
   licence: "Licence", po_pipeline: "PO Pipeline",
-  grn_reliability: "GRN Reliability", item_expiry: "Item Expiry",
+  grn_reliability: "GRN Reliability",
 };
 const reasonColor = (code) => {
   if (code.startsWith("COVER_CRITICAL")) return T.red;
   if (code.includes("EXPIRED")) return T.red;
-  if (code.startsWith("BUDGET_BLOCKED") || code.startsWith("RULE_CONFLICT")) return T.purple;
-  if (code.includes("LICENSE_EXPIRING") || code.includes("REGISTRATION_EXPIRING")) return T.amber;
+  if (code.includes("_RISK_")) return T.red;      // licence < 1 yr
+  if (code.includes("_ALERT_")) return T.amber;   // licence 1–1.5 yr
+  if (code.startsWith("RULE_CONFLICT")) return T.purple;
   if (code.startsWith("COVER_") || code.startsWith("UNDER_FORECAST") ||
-      code.startsWith("BUDGET_OVERRUN") || code.startsWith("FORECAST_")) return T.amber;
+      code.startsWith("FORECAST_")) return T.amber;
   return T.muted;
 };
 
@@ -295,16 +295,19 @@ function RiskBar({ score }) {
   );
 }
 
-/* Licence cell: Imp / Reg days coloured by urgency */
+/* Licence cell: current date vs expiry, shown in months/years.
+   expired -> EXP (red) · <1yr RISK (red) · 1-1.5yr ALERT (amber) ·
+   >=1.5yr safe (green, still shows time left, e.g. "2.3y") */
 function LicenceCell({ impDays, regDays, bg }) {
   const part = (label, days) => {
     if (days === null || days === undefined)
       return <span style={{ color: T.muted }}>{label} —</span>;
     const d = toNumber(days);
-    const color = d < 30 ? T.red : d < 60 ? T.amber : T.muted;
+    const color = d < 0 ? T.red : d < 365 ? T.red : d < 548 ? T.amber : T.green;
+    const left = d < 0 ? "EXP" : d < 365 ? `${Math.round(d / 30.44)}mo` : `${(d / 365).toFixed(1)}y`;
     return (
-      <span style={{ color, fontWeight: d < 60 ? 800 : 500 }}>
-        {label} {d < 0 ? "EXP" : `${d}d`}
+      <span style={{ color, fontWeight: d < 548 ? 800 : 600 }}>
+        {label} {left}
       </span>
     );
   };
@@ -534,7 +537,7 @@ export default function Recommendations() {
                     {formatNum(run_meta.n_recommendations)} actions
                   </span>
                 </>
-              ) : "Forecast · inventory · budget · licence signals → prioritised prevention actions."}
+              ) : "Forecast · inventory · licence signals → prioritised prevention actions."}
             </div>
           </div>
         </div>
@@ -570,24 +573,24 @@ export default function Recommendations() {
             ["Expected Growth",
               f.growth_pct == null ? "—" : `${f.growth_pct > 0 ? "+" : ""}${f.growth_pct}%`,
               f.growth_pct > 0 ? T.green : f.growth_pct < 0 ? T.red : T.text],
-            ["Confidence", f.confidence ?? "—", CONFIDENCE_COLOR[f.confidence] || T.text],
           ]} />
         <SummaryCard title="Inventory Status" accent={T.amber} glyph="▦" delay={40}
           rows={[
-            ["Warehouse", formatNum(inv.wh_stock)],
-            ["Distributor", formatNum(inv.db_stock)],
-            ["Trade Stock", formatNum(inv.trade_stock)],
-            ["Median Cover", inv.median_cover_months == null ? "—"
+            ["Warehouse (Trade-NoRisk)", formatNum(inv.wh_no_risk)],
+            ["Distributor (Trade-NoRisk)", formatNum(inv.db_no_risk)],
+            ["No-Risk Stock", formatNum(inv.no_risk_stock), T.green],
+            ["Median Cover (No-Risk)", inv.median_cover_months == null ? "—"
               : `${fmtDec(inv.median_cover_months)} mo`, invStatusColor],
             ["Status", inv.status ?? "—", invStatusColor],
           ]} />
         <SummaryCard title="Supply Constraints — Licences" accent={T.purple} glyph="✦" delay={80}
           rows={lic.available ? [
-            ["Import Expired", formatNum(lic.import_expired), toNumber(lic.import_expired) > 0 ? T.red : T.text],
-            ["Import < 30 days", formatNum(lic.import_expiring_30d), toNumber(lic.import_expiring_30d) > 0 ? T.red : T.text],
-            ["Import < 90 days", formatNum(lic.import_expiring_90d), toNumber(lic.import_expiring_90d) > 0 ? T.amber : T.text],
-            ["Registration Expired", formatNum(lic.registration_expired), toNumber(lic.registration_expired) > 0 ? T.red : T.text],
-            ["Registration < 60 days", formatNum(lic.registration_expiring_60d), toNumber(lic.registration_expiring_60d) > 0 ? T.amber : T.text],
+            ["Import Expired", formatNum(lic.import?.expired), toNumber(lic.import?.expired) > 0 ? T.red : T.text],
+            ["Import < 1 yr (Risk)", formatNum(lic.import?.risk_1y), toNumber(lic.import?.risk_1y) > 0 ? T.red : T.text],
+            ["Import 1–1.5 yr (Alert)", formatNum(lic.import?.alert_18m), toNumber(lic.import?.alert_18m) > 0 ? T.amber : T.text],
+            ["Reg. Expired", formatNum(lic.registration?.expired), toNumber(lic.registration?.expired) > 0 ? T.red : T.text],
+            ["Reg. < 1 yr (Risk)", formatNum(lic.registration?.risk_1y), toNumber(lic.registration?.risk_1y) > 0 ? T.red : T.text],
+            ["Reg. 1–1.5 yr (Alert)", formatNum(lic.registration?.alert_18m), toNumber(lic.registration?.alert_18m) > 0 ? T.amber : T.text],
           ] : [["Licence data", "NOT COLLECTED", T.muted]]} />
         <CoverageCard weight={factor_coverage.weight_covered} confidence={confidence}
           availability={availability} delay={120} />
@@ -597,11 +600,10 @@ export default function Recommendations() {
       <SectionLabel accent={T.red}>Recommended Actions</SectionLabel>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 22 }}>
         <Kpi glyph="⊘" delay={0}   label="Stop Procurement" value={formatNum(kpis.stop_procurement)} color={T.red}    sub="Registration expired" />
-        <Kpi glyph="✦" delay={30}  label="Renew Licence"    value={formatNum(kpis.renew_licence)}    color={T.amber}  sub="Import licence lapsing" />
+        <Kpi glyph="✦" delay={30}  label="Renew Licence"    value={formatNum(kpis.renew_licence)}    color={T.amber}  sub="Import licence < 1 yr" />
         <Kpi glyph="▲" delay={60}  label="Reorder Urgent"   value={formatNum(kpis.critical)}         color={T.red}    sub="Cover critically low" />
         <Kpi glyph="◔" delay={90}  label="Reorder Review"   value={formatNum(kpis.reorder_review)}   color={T.amber}  sub="Replenishment due" />
-        <Kpi glyph="▣" delay={120} label="Budget Blocked"   value={formatNum(kpis.budget_blocked)}   color={T.purple} sub="Unfundable need" />
-        <Kpi glyph="◉" delay={150} label="Monitor"          value={formatNum(kpis.monitor)}          color={T.blue}   sub="Watchlist" />
+        <Kpi glyph="◉" delay={120} label="Monitor"          value={formatNum(kpis.monitor)}          color={T.blue}   sub="Watchlist" />
       </div>
 
       {/* ── Factor coverage chips ── */}
@@ -669,7 +671,7 @@ export default function Recommendations() {
               {(TABS.find(t => t.key === tab) || {}).label} — Prevention Actions
             </div>
             <div style={{ fontSize: 10.5, color: T.muted }}>
-              Gated decision logic: regulatory → licence renewal → budget → reorder · sorted by priority & risk
+              Gated decision logic: regulatory → licence renewal → reorder · sorted by priority & risk
             </div>
           </div>
           <span style={{ background: tabAccent + "14", border: `1px solid ${tabAccent}30`,
@@ -702,7 +704,7 @@ export default function Recommendations() {
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.red }}>Weighted factors</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>Gated decision</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>Stock ÷ demand</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>No-risk stock ÷ demand</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>To target cover</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.green }}>MOQ / multiple applied</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Days remaining</th>
@@ -724,7 +726,22 @@ export default function Recommendations() {
                         onMouseEnter={e => e.currentTarget.style.background = meta.color + "0D"}
                         onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                         <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right", minWidth: 36 }}>{rowNum}</td>
-                        <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
+                        {/* Unmapped/new products carry synthetic keys "label::agency::product" —
+                            display the label + product, keep the full key in the tooltip */}
+                        <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}
+                          title={String(r.ItemCode)}>
+                          {String(r.ItemCode).includes("::") ? (
+                            <span>
+                              {String(r.ItemCode).split("::")[0]}
+                              <InfoTag text="New" color={T.teal} />
+                              <div style={{ fontSize: 9, color: T.muted, fontWeight: 500,
+                                fontFamily: FONT_UI, marginTop: 2, maxWidth: 160,
+                                overflow: "hidden", textOverflow: "ellipsis" }}>
+                                {String(r.ItemCode).split("::")[2] || String(r.ItemCode).split("::")[1]}
+                              </div>
+                            </span>
+                          ) : r.ItemCode}
+                        </td>
                         <td style={{ ...tdBase, background: bg, minWidth: 120 }}>
                           <RiskBar score={r.risk_score} />
                         </td>
