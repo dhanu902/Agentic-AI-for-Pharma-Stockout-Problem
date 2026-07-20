@@ -204,7 +204,9 @@ def _load_inventory() -> pd.DataFrame:
     """Current stock position — SAME basis as Risk/Horizon pages
     (risk_base_snapshot.csv; built on demand if absent).
 
-    Returns: ItemCode, TradeStock [, WH_Stock, DB_Stock, ABC_Class, AgencyName]
+    Returns: ItemCode, TradeStock, NoRiskStock
+             [, WH_Stock, DB_Stock, WH_NoRisk, DB_NoRisk,
+                ABC_Class, AgencyName]
     """
     try:
         snap = load_risk_base_snapshot()
@@ -266,11 +268,6 @@ def _load_inventory() -> pd.DataFrame:
 
 
 def _load_license() -> Optional[pd.DataFrame]:
-
-
-    print("License path:", LICENSE_XLSX_PATH)
-    print("Exists:", os.path.exists(LICENSE_XLSX_PATH))
-
     """License.xlsx (Master Data), sheet 'License'.
     Expected: ItemCode, Import_License_Expiry, Registration_Expiry.
     Status columns are ignored — status derives from dates so it can
@@ -284,6 +281,8 @@ def _load_license() -> Optional[pd.DataFrame]:
     must not raise a STOP_PROCUREMENT or inflate the constraint card).
     """
     if not os.path.exists(LICENSE_XLSX_PATH):
+        print(f"[RECO] License.xlsx not found at {LICENSE_XLSX_PATH} — "
+              f"licence factor unavailable")
         return None
     df = pd.read_excel(LICENSE_XLSX_PATH, sheet_name=LICENSE_SHEET)
     df.columns = df.columns.astype(str).str.strip()
@@ -370,19 +369,34 @@ def _build_summary(history: pd.DataFrame, current: pd.DataFrame,
                   else "OK")
 
     # Licence bands: current date vs expiry — expired | <1yr RISK |
-    # 1-1.5yr ALERT | >=1.5yr safe (matches engine LICENCE_RISK/ALERT_DAYS)
+    # 1-1.5yr ALERT | >=1.5yr safe (matches engine LICENCE_RISK/ALERT_DAYS).
+    #
+    # FIX: bands are counted against the FULL planner universe (current),
+    # not just the rows present in License.xlsx. Two leak paths existed:
+    #   1. budgeted SKUs with NO ROW in License.xlsx fell into no band;
+    #   2. rows with a BLANK/unparseable date -> NaT -> days = NaN, which
+    #      fails every band comparison and silently vanished.
+    # Both now land in an explicit "no_data" bucket so every column sums
+    # to the universe size. NO DATA is invisible risk, not zero risk —
+    # surfacing the count is the point.
     lic_summary = {"available": licence is not None}
     if licence is not None and not licence.empty:
+        n_universe = int(current[COL_ITEM].nunique())
         imp_days = (licence[COL_IMPORT_EXPIRY] - as_of).dt.days
         reg_days = (licence[COL_REG_EXPIRY] - as_of).dt.days
 
         def _bands(days):
-            return {
+            b = {
                 "expired": int((days < 0).sum()),
                 "risk_1y": int(((days >= 0) & (days < 365)).sum()),
                 "alert_18m": int(((days >= 365) & (days < 548)).sum()),
                 "safe": int((days >= 548).sum()),
             }
+            # universe minus everything banded: covers SKUs absent from
+            # License.xlsx AND NaT dates in one number. max(0,...) guards
+            # the fallback where licence data wasn't budget-filtered.
+            b["no_data"] = max(0, n_universe - sum(b.values()))
+            return b
 
         lic_summary["import"] = _bands(imp_days)
         lic_summary["registration"] = _bands(reg_days)

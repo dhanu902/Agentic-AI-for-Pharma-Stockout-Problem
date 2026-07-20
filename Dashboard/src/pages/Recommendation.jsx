@@ -588,9 +588,13 @@ export default function Recommendations() {
             ["Import Expired", formatNum(lic.import?.expired), toNumber(lic.import?.expired) > 0 ? T.red : T.text],
             ["Import < 1 yr (Risk)", formatNum(lic.import?.risk_1y), toNumber(lic.import?.risk_1y) > 0 ? T.red : T.text],
             ["Import 1–1.5 yr (Alert)", formatNum(lic.import?.alert_18m), toNumber(lic.import?.alert_18m) > 0 ? T.amber : T.text],
+            ["Import > 1.5 yr (Safe)", formatNum(lic.import?.safe), T.green],
+            ["Import No Data", formatNum(lic.import?.no_data), T.muted],
             ["Reg. Expired", formatNum(lic.registration?.expired), toNumber(lic.registration?.expired) > 0 ? T.red : T.text],
             ["Reg. < 1 yr (Risk)", formatNum(lic.registration?.risk_1y), toNumber(lic.registration?.risk_1y) > 0 ? T.red : T.text],
             ["Reg. 1–1.5 yr (Alert)", formatNum(lic.registration?.alert_18m), toNumber(lic.registration?.alert_18m) > 0 ? T.amber : T.text],
+            ["Reg. > 1.5 yr (Safe)", formatNum(lic.registration?.safe), T.green],
+            ["Reg. No Data", formatNum(lic.registration?.no_data), T.muted],
           ] : [["Licence data", "NOT COLLECTED", T.muted]]} />
         <CoverageCard weight={factor_coverage.weight_covered} confidence={confidence}
           availability={availability} delay={120} />
