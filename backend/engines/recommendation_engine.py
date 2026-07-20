@@ -414,6 +414,11 @@ def _cover_critical(row) -> bool:
     return cm is not None and np.isfinite(cm) and cm < CRITICAL_COVER_MONTHS
 
 
+def _cover_below_1m(row) -> bool:
+    cm = row.get("cover_months")
+    return cm is not None and np.isfinite(cm) and cm < 1.0
+
+
 def _needs_stock(row) -> bool:
     return _cover_critical(row) or (row.get("gap_qty") or 0) > 0
 
@@ -423,14 +428,25 @@ def _action(row) -> str:
     1. Registration expired -> STOP_PROCUREMENT (ordering is illegal).
     2. Import licence in RISK band + stock needed -> RENEW_IMPORT_LICENCE
        (the renewal IS the stockout-prevention action, not a PO).
-    3. Score ladder with the cover<0.5 hard floor."""
+    3. Score ladder — with two guards:
+       - ACTIONS REQUIRE A PHYSICAL STOCK NEED (gap_qty > 0 or critical
+         cover). A stock-rich SKU whose score comes only from forecast
+         volatility is a forecast-quality issue, not a stockout action —
+         its score and reasons stay visible in all_items, action = OK.
+       - COVER FLOORS: < 0.5 months -> REORDER_URGENT regardless of the
+         blend; < 1.0 month -> at least REORDER_REVIEW. Stock that runs
+         dry inside a month must never sit in Monitor."""
     if row.get("reg_expired", False):
         return "STOP_PROCUREMENT"
     if row.get("import_gate", False) and _needs_stock(row):
         return "RENEW_IMPORT_LICENCE"
-    if row["risk_score"] >= SCORE_CRITICAL or _cover_critical(row):
+    if _cover_critical(row):
         return "REORDER_URGENT"
-    if row["risk_score"] >= SCORE_REORDER:
+    if not _needs_stock(row):
+        return "OK"
+    if row["risk_score"] >= SCORE_CRITICAL:
+        return "REORDER_URGENT"
+    if row["risk_score"] >= SCORE_REORDER or _cover_below_1m(row):
         return "REORDER_REVIEW"
     if row["risk_score"] >= SCORE_MONITOR:
         return "MONITOR"
@@ -441,9 +457,12 @@ def _priority(row) -> str:
     if row.get("reg_expired", False):
         return "CRITICAL"
     if (row.get("import_gate", False) and _needs_stock(row)) \
-            or row["risk_score"] >= SCORE_CRITICAL or _cover_critical(row):
+            or _cover_critical(row) \
+            or (_needs_stock(row) and row["risk_score"] >= SCORE_CRITICAL):
         return "HIGH"
-    if row["risk_score"] >= SCORE_REORDER:
+    if _needs_stock(row) and (
+        row["risk_score"] >= SCORE_REORDER or _cover_below_1m(row)
+    ):
         return "MEDIUM"
     return "LOW"
 
