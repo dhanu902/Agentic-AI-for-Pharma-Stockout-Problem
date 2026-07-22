@@ -34,11 +34,13 @@ def get_agency_performance_results():
     if not result.get("ok"):
         return jsonify(result), 500
 
-    rows        = result.get("rows", [])
-    budget_rows = result.get("budget_rows", [])
+    rows          = result.get("rows", [])
+    budget_rows   = result.get("budget_rows", [])
+    forecast_rows = result.get("forecast_rows", [])
 
-    # Optional server-side agency filter — applied to BOTH row sets so the
-    # performance table and budget analysis table stay consistent.
+    # Optional server-side agency filter — applied to ALL row sets so the
+    # performance table, budget analysis table, and forecast comparison
+    # table stay consistent.
     agency = request.args.get("agency")
     if agency:
         rows = [
@@ -49,12 +51,19 @@ def get_agency_performance_results():
             r for r in budget_rows
             if str(r.get("Agency", "")).lower() == agency.lower()
         ]
+        forecast_rows = [
+            r for r in forecast_rows
+            if str(r.get("Agency", "")).lower() == agency.lower()
+        ]
 
-    # Pass meta AND budget_rows through — the frontend needs budget_rows for
-    # the Budget Analysis tab and the Budget/Performance KPI strips.
+    # Pass meta AND budget_rows/forecast_rows through — the frontend needs
+    # budget_rows for the Budget Analysis tab, forecast_rows for the new
+    # Forecast tab (model vs third-party forecasts, budgeted SKUs only),
+    # and meta for the KPI strips.
     return jsonify({
-        "ok":          True,
-        "rows":        rows,
-        "budget_rows": budget_rows,
-        "meta":        result.get("meta"),
+        "ok":            True,
+        "rows":          rows,
+        "budget_rows":   budget_rows,
+        "forecast_rows": forecast_rows,
+        "meta":          result.get("meta"),
     }), 200
