@@ -1,7 +1,9 @@
 // src/pages/Insights.jsx
 //
 // UI v2 — visual upgrade only. All KPIs, data flow, sorting, filtering,
-// pagination and calculations are IDENTICAL to v1.
+// pagination and calculations are IDENTICAL to v1 for the existing tabs.
+// Added: Forecast tab (table only, no KPI cards) comparing our model's
+// forecast against third-party forecasts for the budgeted SKU universe.
 
 import React, { useEffect, useMemo, useState } from "react";
 import T from "../theme";
@@ -529,6 +531,13 @@ const LOSS_COLS = [
   "Raw Loss", "Stockout Loss", "Other Loss", "Reason",
 ];
 
+/* Forecast tab — model vs third-party forecasts, budgeted SKUs only.
+   Table only, no KPI cards above it. */
+const FORECAST_COLS = [
+  "#", "Agency", "Item Code", "Item Name", "Forecast Month",
+  "My Model", "Approved Consensus", "Best Fit With MI", "Consensus", "Final Forecast",
+];
+
 function SortBtn({ col, label, sortCol, setSortCol, accent }) {
   const active = sortCol === col;
   const acc = accent || T.purple;
@@ -549,25 +558,29 @@ function SortBtn({ col, label, sortCol, setSortCol, accent }) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   MAIN COMPONENT — all state / data logic identical to v1
+   MAIN COMPONENT — all state / data logic identical to v1,
+   plus a new Forecast tab (table only).
 ════════════════════════════════════════════════════════════════ */
 export default function Insights() {
   const [rows, setRows]             = useState([]);
   const [budgetRows, setBudgetRows] = useState([]);
+  const [forecastRows, setForecastRows] = useState([]);
   const [meta, setMeta]             = useState(null);
   const [agency, setAgency]         = useState("");
   const [activeTab, setTab]         = useState("budget");
   const [sortBudget, setSortBudget] = useState("Budget_Qty");
   const [sortPerf, setSortPerf]     = useState("Model_Accuracy_%");
   const [sortLoss, setSortLoss]     = useState("Raw_Loss_Qty");
+  const [sortForecast, setSortForecast] = useState("My_Model_Forecast_Qty");
   const [loading, setLoading]       = useState(false);
   const [running, setRunning]       = useState(false);
   const [error, setError]           = useState("");
 
   // Pagination — one page counter per table, only used when "All Agencies" is selected
-  const [budgetPage, setBudgetPage] = useState(1);
-  const [perfPage, setPerfPage]     = useState(1);
-  const [lossPage, setLossPage]     = useState(1);
+  const [budgetPage, setBudgetPage]     = useState(1);
+  const [perfPage, setPerfPage]         = useState(1);
+  const [lossPage, setLossPage]         = useState(1);
+  const [forecastPage, setForecastPage] = useState(1);
 
   const fetchResults = async () => {
     setLoading(true); setError("");
@@ -577,6 +590,7 @@ export default function Insights() {
       if (!res.ok || !result.ok) throw new Error(result.error || "Failed to load");
       setRows(Array.isArray(result.rows) ? result.rows : []);
       setBudgetRows(Array.isArray(result.budget_rows) ? result.budget_rows : []);
+      setForecastRows(Array.isArray(result.forecast_rows) ? result.forecast_rows : []);
       setMeta(result.meta || null);
     } catch (e) { setError(e.message); }
     finally { setLoading(false); }
@@ -596,19 +610,21 @@ export default function Insights() {
   useEffect(() => { fetchResults(); }, []);
 
   // Reset all pagination whenever the agency filter changes
-  useEffect(() => { setBudgetPage(1); setPerfPage(1); setLossPage(1); }, [agency]);
+  useEffect(() => { setBudgetPage(1); setPerfPage(1); setLossPage(1); setForecastPage(1); }, [agency]);
   // Reset the relevant page whenever its sort changes
   useEffect(() => { setBudgetPage(1); }, [sortBudget]);
   useEffect(() => { setPerfPage(1); }, [sortPerf]);
   useEffect(() => { setLossPage(1); }, [sortLoss]);
+  useEffect(() => { setForecastPage(1); }, [sortForecast]);
 
   const agencies = useMemo(() => {
     const set = new Set([
       ...rows.map(r => r.Agency).filter(Boolean),
       ...budgetRows.map(r => r.Agency).filter(Boolean),
+      ...forecastRows.map(r => r.Agency).filter(Boolean),
     ]);
     return [...set].sort();
-  }, [rows, budgetRows]);
+  }, [rows, budgetRows, forecastRows]);
 
   const filtered = useMemo(() =>
     agency ? rows.filter(r => r.Agency === agency) : rows, [rows, agency]);
@@ -616,6 +632,10 @@ export default function Insights() {
   const filteredBudget = useMemo(() =>
     agency ? budgetRows.filter(r => r.Agency === agency) : budgetRows,
   [budgetRows, agency]);
+
+  const filteredForecast = useMemo(() =>
+    agency ? forecastRows.filter(r => r.Agency === agency) : forecastRows,
+  [forecastRows, agency]);
 
   const budgetTableRows = useMemo(() =>
     [...filteredBudget].sort((a, b) => {
@@ -637,6 +657,13 @@ export default function Insights() {
       .sort((a, b) => toNumber(b[sortLoss]) - toNumber(a[sortLoss])),
   [filtered, sortLoss]);
 
+  const forecastTableRows = useMemo(() =>
+    [...filteredForecast].sort((a, b) => {
+      const av = a[sortForecast], bv = b[sortForecast];
+      if (av == null) return 1; if (bv == null) return -1;
+      return toNumber(bv) - toNumber(av);
+    }), [filteredForecast, sortForecast]);
+
   // Paginated slices: full list when an agency is selected, 20/page otherwise
   const budgetPaged = useMemo(() =>
     agency ? budgetTableRows : budgetTableRows.slice((budgetPage - 1) * PAGE_SIZE, budgetPage * PAGE_SIZE),
@@ -649,6 +676,10 @@ export default function Insights() {
   const lossPaged = useMemo(() =>
     agency ? lossRows : lossRows.slice((lossPage - 1) * PAGE_SIZE, lossPage * PAGE_SIZE),
   [lossRows, agency, lossPage]);
+
+  const forecastPaged = useMemo(() =>
+    agency ? forecastTableRows : forecastTableRows.slice((forecastPage - 1) * PAGE_SIZE, forecastPage * PAGE_SIZE),
+  [forecastTableRows, agency, forecastPage]);
 
   /* ── KPI summaries (identical to v1) ── */
   const kpi = useMemo(() => {
@@ -699,7 +730,10 @@ export default function Insights() {
     };
   }, [filtered, filteredBudget]);
 
-  const tabAccent = activeTab === "loss" ? T.red : activeTab === "performance" ? T.blue : T.purple;
+  const tabAccent = activeTab === "loss" ? T.red
+    : activeTab === "performance" ? T.blue
+    : activeTab === "forecast" ? T.teal
+    : T.purple;
 
   return (
     <div style={{ minHeight: "100vh",
@@ -902,6 +936,10 @@ export default function Insights() {
           badge={lossRows.length} badgeColor={kpi.stockoutSkus > 0 ? T.red : T.amber} accent={T.red}>
           Loss Analysis
         </Tab>
+        <Tab active={activeTab === "forecast"} onClick={() => setTab("forecast")}
+          badge={forecastTableRows.length} badgeColor={T.teal} accent={T.teal}>
+          Forecast
+        </Tab>
       </div>
 
       <div className="ins-fade" key={activeTab} style={{ background: T.card, border: `1px solid ${T.border}`,
@@ -921,14 +959,18 @@ export default function Insights() {
                 ? `Budget Analysis ${agency ? `— ${agency}` : "— All Agencies"}`
                 : activeTab === "performance"
                 ? `SKU-Wise Performance ${agency ? `— ${agency}` : "— All Agencies"}`
-                : `Loss Breakdown ${agency ? `— ${agency}` : "— All Agencies"}`}
+                : activeTab === "loss"
+                ? `Loss Breakdown ${agency ? `— ${agency}` : "— All Agencies"}`
+                : `Forecast Comparison ${agency ? `— ${agency}` : "— All Agencies"}`}
             </div>
             <div style={{ fontSize: 10.5, color: T.muted }}>
               {activeTab === "budget"
                 ? "All budgeted items · monthly achievement (actual & forecast vs budget) · annual progress"
                 : activeTab === "performance"
                 ? "Forecast accuracy · MoM growth · stockout loss · SHP"
-                : "Per-SKU loss decomposition: Raw = Stockout + Other (stock-covered gap)"}
+                : activeTab === "loss"
+                ? "Per-SKU loss decomposition: Raw = Stockout + Other (stock-covered gap)"
+                : `Our model vs third-party forecasts for ${meta?.forecast_month || "the current forecast month"} · budgeted SKUs only`}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
@@ -951,11 +993,19 @@ export default function Insights() {
                 <SortBtn col="Next_Month_Forecast"    label="Next Forecast" sortCol={sortPerf} setSortCol={setSortPerf} accent={T.blue} />
                 <SortBtn col="Raw_Loss_Qty"           label="Loss"          sortCol={sortPerf} setSortCol={setSortPerf} accent={T.blue} />
               </>
-            ) : (
+            ) : activeTab === "loss" ? (
               <>
                 <SortBtn col="Raw_Loss_Qty"      label="Raw Loss" sortCol={sortLoss} setSortCol={setSortLoss} accent={T.red} />
                 <SortBtn col="Stockout_Loss_Qty" label="Stockout" sortCol={sortLoss} setSortCol={setSortLoss} accent={T.red} />
                 <SortBtn col="Other_Loss_Qty"    label="Other"    sortCol={sortLoss} setSortCol={setSortLoss} accent={T.red} />
+              </>
+            ) : (
+              <>
+                <SortBtn col="My_Model_Forecast_Qty"               label="My Model"          sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
+                <SortBtn col="Approved_Consensus_Forecast_Qty"     label="Approved Consensus" sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
+                <SortBtn col="Best_Fit_With_MI_Forecast_Qty"       label="Best Fit MI"        sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
+                <SortBtn col="Consensus_Forecast_Qty"              label="Consensus"          sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
+                <SortBtn col="Final_Forecast_Qty"                  label="Final"              sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
               </>
             )}
             <span style={{ background: tabAccent + "14",
@@ -964,7 +1014,9 @@ export default function Insights() {
               borderRadius: 999, padding: "4px 12px", fontSize: 11, fontWeight: 900,
               fontFamily: FONT_MONO, marginLeft: 4 }}>
               {activeTab === "budget" ? budgetTableRows.length
-                : activeTab === "performance" ? perfRows.length : lossRows.length} SKUs
+                : activeTab === "performance" ? perfRows.length
+                : activeTab === "loss" ? lossRows.length
+                : forecastTableRows.length} SKUs
             </span>
           </div>
         </div>
@@ -1153,7 +1205,7 @@ export default function Insights() {
             </>
           )
 
-        ) : (
+        ) : activeTab === "loss" ? (
 
           /* ── LOSS ANALYSIS TABLE ── */
           lossRows.length === 0 ? (
@@ -1258,6 +1310,64 @@ export default function Insights() {
                 </table>
               </div>
               <Pagination page={lossPage} setPage={setLossPage} total={lossRows.length} accent={T.red} />
+            </>
+          )
+
+        ) : (
+
+          /* ── FORECAST TABLE (model vs third-party, budgeted SKUs only) ──
+             Table only — no KPI cards for this tab. */
+          forecastTableRows.length === 0 ? (
+            <EmptyState glyph="◔" title="No forecast comparison records found"
+              hint="Run the engine, and confirm Forecast.xlsx has rows for the current forecast month." />
+          ) : (
+            <>
+              <div className="ins-scroll" style={{ overflowX: "auto", borderRadius: 12, border: `1px solid ${T.border}` }}>
+                <table style={{ width: "100%", borderCollapse: "collapse",
+                  fontFamily: FONT_MONO, fontSize: 11 }}>
+                  <thead>
+                    <tr>{FORECAST_COLS.map(h => <th key={h} style={thStyle}>{h}</th>)}</tr>
+                    <tr>
+                      {Array.from({ length: 5 }).map((_, i) => (
+                        <th key={i} style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
+                      ))}
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.teal }}>Our model</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {forecastPaged.map((r, idx) => {
+                      const rowNum = agency ? idx + 1 : (forecastPage - 1) * PAGE_SIZE + idx + 1;
+                      const bg     = idx % 2 === 0 ? T.card : T.surface + "66";
+                      const cell = (v) => v != null
+                        ? formatNum(v)
+                        : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>;
+                      return (
+                        <tr key={`${r.ItemCode}-${rowNum}`} className="ins-row"
+                          onMouseEnter={e => e.currentTarget.style.background = T.teal + "0D"}
+                          onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
+                          <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right", minWidth: 36 }}>{rowNum}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, fontFamily: FONT_UI }}>{r.Agency || "—"}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.text, minWidth: 200, fontFamily: FONT_UI, fontWeight: 500 }}>{r.ItemName || "—"}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.muted }}>{r.Forecast_Month || "—"}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.teal, fontWeight: 900, textAlign: "right" }}>
+                            {cell(r.My_Model_Forecast_Qty)}
+                          </td>
+                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Approved_Consensus_Forecast_Qty)}</td>
+                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Best_Fit_With_MI_Forecast_Qty)}</td>
+                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Consensus_Forecast_Qty)}</td>
+                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Final_Forecast_Qty)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              <Pagination page={forecastPage} setPage={setForecastPage} total={forecastTableRows.length} accent={T.teal} />
             </>
           )
         )}

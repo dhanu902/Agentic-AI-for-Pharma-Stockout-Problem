@@ -31,6 +31,29 @@ BUDGET_FILE           = os.path.join(PROJECT_DIR, "data", "Master Data", "Budget
 # "Focus Budget 26 27 FY" only contains forecasted items — do NOT use it for totals.
 BUDGET_SHEET_NAME = "All Budget 26 27 FY"
 
+# ─────────────────────────────────────────────────────────────
+# Forecast comparison (Forecast tab) — third-party forecasts vs our model
+# ─────────────────────────────────────────────────────────────
+# External forecasts supplied by other parties/systems. Compared against our
+# own model's forecast for the SAME month, restricted to the budgeted SKU
+# list (763 items). Sheet has one row per PlantId/DataMeasure/ForecastDate/
+# ProductId combo; DataMeasure identifies which forecasting method produced
+# the row.
+FORECAST_COMPARISON_FILE = (
+    "/Users/dhanujiamanda/Documents/Projects/Agentic AI /Pipeline/"
+    "Agentic-AI-for-Pharma-Stockout-Problem/data/Forecast.xlsx"
+)
+FORECAST_COMPARISON_SHEET = "Sheet1"
+
+# DataMeasure (as it appears in the sheet) → output column name.
+# Renamed to be self-explanatory in the UI table.
+FORECAST_MEASURE_COLUMN_MAP = {
+    "Approved Consensus Forecast": "Approved_Consensus_Forecast_Qty",
+    "Best Fit With MI":            "Best_Fit_With_MI_Forecast_Qty",
+    "Consensus Forecast":          "Consensus_Forecast_Qty",
+    "Final Forecast":              "Final_Forecast_Qty",
+}
+
 _MONTH_MAP = { "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,}
 
 
@@ -787,6 +810,104 @@ def load_budget_lookup(current_month_dt):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Forecast comparison loader — third-party forecasts (Forecast.xlsx)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_external_forecast_comparison(target_month_dt):
+    """
+    Reads Forecast.xlsx (Sheet1) — third-party forecasts per ProductId,
+    filtered to `target_month_dt` (the month currently shown on the Insights
+    UI, i.e. the model's next forecast month). Pivots the four known
+    DataMeasure labels into separate, clearly-named columns:
+
+        "Approved Consensus Forecast" → Approved_Consensus_Forecast_Qty
+        "Best Fit With MI"            → Best_Fit_With_MI_Forecast_Qty
+        "Consensus Forecast"          → Consensus_Forecast_Qty
+        "Final Forecast"              → Final_Forecast_Qty
+
+    Any DataMeasure value outside this list is ignored. Where a SKU has more
+    than one row for the same DataMeasure/month (re-runs), the most recently
+    updated row wins (LastUpdate, then CreationDate).
+
+    Returns: ItemCode | Approved_Consensus_Forecast_Qty
+             | Best_Fit_With_MI_Forecast_Qty | Consensus_Forecast_Qty
+             | Final_Forecast_Qty
+    """
+    out_cols = ["ItemCode"] + list(FORECAST_MEASURE_COLUMN_MAP.values())
+    empty = pd.DataFrame(columns=out_cols)
+
+    if not os.path.exists(FORECAST_COMPARISON_FILE):
+        print(f"[INSIGHTS] Forecast comparison file not found: {FORECAST_COMPARISON_FILE}")
+        return empty
+
+    try:
+        df = pd.read_excel(FORECAST_COMPARISON_FILE, sheet_name=FORECAST_COMPARISON_SHEET)
+        df.columns = df.columns.astype(str).str.strip()
+
+        required = ["ProductId", "DataMeasure", "ForecastDate", "Quantity"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"[INSIGHTS] Forecast comparison file missing columns: {missing}. "
+                  f"Found: {list(df.columns)}")
+            return empty
+
+        df["ForecastDate"] = pd.to_datetime(df["ForecastDate"], errors="coerce")
+        df = df.dropna(subset=["ForecastDate"])
+
+        target_month = pd.Timestamp(
+            pd.Timestamp(target_month_dt).year, pd.Timestamp(target_month_dt).month, 1
+        )
+        # Normalise ForecastDate to month-start before comparing, so any
+        # day-of-month value in the sheet still matches the target month.
+        df["_fc_month"] = df["ForecastDate"].values.astype("datetime64[M]")
+        df = df[df["_fc_month"] == target_month].copy()
+
+        if df.empty:
+            print(f"[INSIGHTS] Forecast comparison: no rows for {target_month:%b %Y}.")
+            return empty
+
+        df["ItemCode"] = (
+            pd.to_numeric(df["ProductId"], errors="coerce")
+            .astype("Int64").astype(str).replace("<NA>", np.nan)
+        )
+        df = df.dropna(subset=["ItemCode"])
+
+        df["DataMeasure"] = df["DataMeasure"].astype(str).str.strip()
+        df = df[df["DataMeasure"].isin(FORECAST_MEASURE_COLUMN_MAP.keys())]
+        if df.empty:
+            print("[INSIGHTS] Forecast comparison: no rows matching known DataMeasure "
+                  f"labels ({list(FORECAST_MEASURE_COLUMN_MAP.keys())}).")
+            return empty
+
+        df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+
+        # Keep the most recently updated row per ItemCode + DataMeasure
+        sort_cols = [c for c in ["CreationDate", "LastUpdate"] if c in df.columns]
+        for c in sort_cols:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+        if sort_cols:
+            df = df.sort_values(["ItemCode", "DataMeasure"] + sort_cols)
+        df = df.drop_duplicates(subset=["ItemCode", "DataMeasure"], keep="last")
+
+        pivot = df.pivot_table(
+            index="ItemCode", columns="DataMeasure", values="Quantity", aggfunc="last"
+        ).reset_index()
+
+        pivot = pivot.rename(columns=FORECAST_MEASURE_COLUMN_MAP)
+        for col in FORECAST_MEASURE_COLUMN_MAP.values():
+            if col not in pivot.columns:
+                pivot[col] = np.nan
+            pivot[col] = pd.to_numeric(pivot[col], errors="coerce").round(2)
+
+        print(f"[INSIGHTS] Forecast comparison loaded: {len(pivot)} SKUs for {target_month:%b %Y}.")
+        return pivot[out_cols].copy()
+
+    except Exception as e:
+        print(f"[INSIGHTS] Warning loading forecast comparison file: {e}")
+        import traceback; traceback.print_exc()
+        return empty
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Budget analysis table builder — ALL budgeted items
 # ─────────────────────────────────────────────────────────────────────────────
 def build_budget_analysis_table(budget_sku_lookup, budget_meta,
@@ -957,6 +1078,59 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Forecast comparison table builder — model vs third parties, budgeted SKUs
+# ─────────────────────────────────────────────────────────────────────────────
+def build_forecast_comparison_table(budget_sku_lookup, agency_map,
+                                    own_forecast_lookup, external_forecast_df,
+                                    target_month_label):
+    """
+    One row per budgeted SKU (inner set = the 763-item budget list), comparing
+    our own model's forecast against the third-party forecasts sourced from
+    Forecast.xlsx, both for the SAME month — the month currently shown on the
+    Insights UI (the model's next forecast month).
+
+    own_forecast_lookup: ItemCode | My_Model_Forecast_Qty
+
+    Columns:
+        Agency, ItemCode, ItemName, Forecast_Month,
+        My_Model_Forecast_Qty,
+        Approved_Consensus_Forecast_Qty, Best_Fit_With_MI_Forecast_Qty,
+        Consensus_Forecast_Qty, Final_Forecast_Qty
+    """
+    value_cols = [
+        "My_Model_Forecast_Qty",
+        "Approved_Consensus_Forecast_Qty", "Best_Fit_With_MI_Forecast_Qty",
+        "Consensus_Forecast_Qty", "Final_Forecast_Qty",
+    ]
+    empty = pd.DataFrame(columns=["Agency", "ItemCode", "ItemName", "Forecast_Month"] + value_cols)
+
+    if budget_sku_lookup is None or budget_sku_lookup.empty:
+        return empty
+
+    # Budgeted SKU list only (left join) — this IS the 763-item universe.
+    ft = budget_sku_lookup[["ItemCode"]].drop_duplicates().copy()
+
+    ft = ft.merge(agency_map, on="ItemCode", how="left")
+    ft["Agency"]   = ft["Agency"].fillna("Unknown Agency")
+    ft["ItemName"] = ft["ItemName"].fillna("")
+
+    if own_forecast_lookup is not None and not own_forecast_lookup.empty:
+        ft = ft.merge(own_forecast_lookup, on="ItemCode", how="left")
+    if external_forecast_df is not None and not external_forecast_df.empty:
+        ft = ft.merge(external_forecast_df, on="ItemCode", how="left")
+
+    for col in value_cols:
+        if col not in ft.columns:
+            ft[col] = np.nan
+        ft[col] = pd.to_numeric(ft[col], errors="coerce").round(2)
+
+    ft["Forecast_Month"] = target_month_label
+    ft = ft[["Agency", "ItemCode", "ItemName", "Forecast_Month"] + value_cols].copy()
+    ft = ft.sort_values(["Agency", "ItemCode"]).reset_index(drop=True)
+    return ft
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1111,6 +1285,23 @@ def build_agency_performance_table():
     )
     budget_result = budget_table.where(pd.notnull(budget_table), other=None)
 
+    # ── Forecast comparison table (Forecast tab — budgeted SKUs, same month
+    # the UI is currently showing = next_forecast_month_dt / next_forecast_label) ─
+    own_forecast_lookup = (
+        latest_forecast[["ItemCode", "Next_Month_Forecast"]]
+        .rename(columns={"Next_Month_Forecast": "My_Model_Forecast_Qty"})
+        .copy()
+    )
+    external_forecast_df = load_external_forecast_comparison(next_forecast_month_dt)
+    forecast_comparison_table = build_forecast_comparison_table(
+        budget_sku_lookup, agency_map,
+        own_forecast_lookup, external_forecast_df,
+        next_forecast_label,
+    )
+    forecast_comparison_result = forecast_comparison_table.where(
+        pd.notnull(forecast_comparison_table), other=None
+    )
+
     # ── Meta ─────────────────────────────────────────────────────────────────
     def _fsum(frame, col):
         if col not in frame.columns:
@@ -1152,6 +1343,16 @@ def build_agency_performance_table():
         forecast_source_counts = (
             budget_table["Forecast_Source"].value_counts().to_dict()
         )
+
+    # Coverage of the third-party forecast comparison table
+    forecast_comparison_sku_count = int(len(forecast_comparison_table))
+    forecast_comparison_matched_count = 0
+    if not forecast_comparison_table.empty:
+        any_external = forecast_comparison_table[[
+            "Approved_Consensus_Forecast_Qty", "Best_Fit_With_MI_Forecast_Qty",
+            "Consensus_Forecast_Qty", "Final_Forecast_Qty",
+        ]].notna().any(axis=1)
+        forecast_comparison_matched_count = int(any_external.sum())
 
     meta = {
         "data_available_upto":         data_upto_label,
@@ -1205,6 +1406,10 @@ def build_agency_performance_table():
         # Aggregate gaps for the Performance KPI strip
         "total_budget_vs_actual_loss_qty":   max(total_budget_qty - total_sales, 0.0),
         "total_forecast_vs_actual_loss_qty": max(total_cur_fcst  - total_sales, 0.0),
+
+        # Forecast comparison tab coverage
+        "forecast_comparison_sku_count":         forecast_comparison_sku_count,
+        "forecast_comparison_matched_sku_count": forecast_comparison_matched_count,
     }
 
-    return result, budget_result, meta
+    return result, budget_result, forecast_comparison_result, meta

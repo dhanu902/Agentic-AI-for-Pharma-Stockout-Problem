@@ -183,4 +183,9 @@ Recommendation Page
 Layer 1: The factor registry and risk score
 Layer 2: The gating ladder
 
+RECOMMENDED ACTIONS Stripe:
+    1) Registration expired. cannot legally be sold or imported
+    2) Renew Licence. reason for dif: some either have enough cover for now (no stock need, so nothing to gate) or fell into gate 1 first.
+    3) Reorder Urgent. SKUs that cleared both licence gates and have either cover < 0.5 months (the hard floor — half a month of stock is always urgent, whatever the blended score says) or risk score ≥ 75 with a genuine stock need.
+    4) Reorder Review.
 

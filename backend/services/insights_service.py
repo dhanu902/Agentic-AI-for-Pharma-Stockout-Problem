@@ -19,6 +19,9 @@ AGENCY_PERFORMANCE_META_PATH = os.path.join(
 BUDGET_ANALYSIS_LATEST_PATH = os.path.join(
     OUTPUT_DIR, "budget_analysis_latest.csv"
 )
+FORECAST_COMPARISON_LATEST_PATH = os.path.join(
+    OUTPUT_DIR, "forecast_comparison_latest.csv"
+)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -32,11 +35,12 @@ def run_agency_performance_engine() -> dict:
         }
 
     try:
-        df, budget_df, meta = build_agency_performance_table()
+        df, budget_df, forecast_df, meta = build_agency_performance_table()
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         df.to_csv(AGENCY_PERFORMANCE_LATEST_PATH, index=False)
         budget_df.to_csv(BUDGET_ANALYSIS_LATEST_PATH, index=False)
+        forecast_df.to_csv(FORECAST_COMPARISON_LATEST_PATH, index=False)
 
         with open(AGENCY_PERFORMANCE_META_PATH, "w") as f:
             json.dump(meta, f, indent=2, default=str)
@@ -45,6 +49,7 @@ def run_agency_performance_engine() -> dict:
             "ok": True,
             "rows": int(len(df)),
             "budget_rows": int(len(budget_df)),
+            "forecast_rows": int(len(forecast_df)),
             "path": AGENCY_PERFORMANCE_LATEST_PATH,
             "data_available_upto": meta.get("data_available_upto"),
             "forecast_month": meta.get("forecast_month"),
@@ -65,9 +70,14 @@ def run_agency_performance_engine() -> dict:
             "total_stockout_loss_qty": meta.get("total_stockout_loss_qty"),
             "total_other_loss_qty": meta.get("total_other_loss_qty"),
 
+            # Forecast comparison (Forecast tab)
+            "forecast_comparison_sku_count": meta.get("forecast_comparison_sku_count"),
+            "forecast_comparison_matched_sku_count": meta.get("forecast_comparison_matched_sku_count"),
+
             "message": (
                 f"Agency performance built for {len(df)} SKUs "
-                f"({len(budget_df)} budgeted items). "
+                f"({len(budget_df)} budgeted items, "
+                f"{len(forecast_df)} forecast-comparison rows). "
                 f"Data up to {meta.get('data_available_upto')}. "
                 f"Forecasting {meta.get('forecast_month')}."
             ),
@@ -90,6 +100,7 @@ def get_agency_performance_rows() -> dict:
             "ok": False,
             "rows": [],
             "budget_rows": [],
+            "forecast_rows": [],
             "meta": None,
             "error": "No agency performance results found. Run the engine first.",
         }
@@ -119,10 +130,26 @@ def get_agency_performance_rows() -> dict:
             except Exception as e:
                 print(f"[INSIGHTS] Warning loading budget analysis rows: {e}")
 
+        forecast_rows = []
+        if os.path.exists(FORECAST_COMPARISON_LATEST_PATH):
+            try:
+                fdf = pd.read_csv(FORECAST_COMPARISON_LATEST_PATH)
+                if "ItemCode" in fdf.columns:
+                    fdf["ItemCode"] = (
+                        pd.to_numeric(fdf["ItemCode"], errors="coerce")
+                        .astype("Int64").astype(str).replace("<NA>", None)
+                    )
+                fdf = fdf.replace([float("inf"), float("-inf")], None)
+                fdf = fdf.astype(object).where(pd.notnull(fdf), None)
+                forecast_rows = fdf.to_dict(orient="records")
+            except Exception as e:
+                print(f"[INSIGHTS] Warning loading forecast comparison rows: {e}")
+
         return {
             "ok": True,
             "rows": rows,
             "budget_rows": budget_rows,
+            "forecast_rows": forecast_rows,
             "meta": meta,
         }
 
@@ -131,6 +158,7 @@ def get_agency_performance_rows() -> dict:
             "ok": False,
             "rows": [],
             "budget_rows": [],
+            "forecast_rows": [],
             "meta": None,
             "error": str(e),
         }
@@ -221,6 +249,24 @@ def _load_meta(df: pd.DataFrame) -> dict:
                     meta[key] = float(
                         pd.to_numeric(bdf[src], errors="coerce").fillna(0).sum()
                     )
+        except Exception:
+            pass
+
+    # Forecast comparison metrics — fallback from the forecast comparison CSV
+    if os.path.exists(FORECAST_COMPARISON_LATEST_PATH):
+        try:
+            fdf = pd.read_csv(FORECAST_COMPARISON_LATEST_PATH)
+            meta["forecast_comparison_sku_count"] = int(len(fdf))
+            external_cols = [
+                c for c in [
+                    "Approved_Consensus_Forecast_Qty", "Best_Fit_With_MI_Forecast_Qty",
+                    "Consensus_Forecast_Qty", "Final_Forecast_Qty",
+                ] if c in fdf.columns
+            ]
+            if external_cols:
+                meta["forecast_comparison_matched_sku_count"] = int(
+                    fdf[external_cols].notna().any(axis=1).sum()
+                )
         except Exception:
             pass
 
