@@ -47,6 +47,19 @@ FORECAST_RUN_LOG_PATH = os.path.join(LOG_DIR, "forecast_run_log.csv")
 TREND_FORECAST_LATEST_PATH = os.path.join(OUTPUT_DIR, "forecast_trend_latest.csv")
 TREND_FORECAST_HISTORY_PATH = os.path.join(LOG_DIR, "forecast_trend_history.csv")
 
+# Combined forecast — model (forecast_latest.csv) + trend
+# (forecast_trend_latest.csv) merged into ONE deduped M+1 table, tagged
+# with Forecast_Source. This is the file downstream consumers (Insights,
+# budget analysis, reporting) should read instead of joining two files
+# themselves. Built by engines/master_forecast_engine.build_combined_forecast_table.
+FORECAST_ALL_SKUS_LATEST_PATH = os.path.join(OUTPUT_DIR, "forecast_all_skus_latest.csv")
+
+# Master-mapped forecast — sku_master_full.csv used as the join anchor,
+# with the combined M+1 forecast and the M+2..M+6 horizon forecast mapped
+# onto every budgeted SKU (real code or synthetic). Built by
+# engines/master_forecast_engine.build_master_forecast_table.
+MASTER_FORECAST_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "forecast_master_mapped.csv")
+
 # Budget master — "All Budget 26 27 FY" holds ALL budgeted items
 # (including SKUs with no sales / no model forecast)
 BUDGET_XLSX_PATH = os.path.join(RAW_DATA_DIR, "Master Data", "Budget.xlsx")
@@ -393,3 +406,206 @@ def load_trend_forecast_history() -> pd.DataFrame:
     if not os.path.exists(TREND_FORECAST_HISTORY_PATH):
         return pd.DataFrame()
     return pd.read_csv(TREND_FORECAST_HISTORY_PATH)
+
+
+# ============================================================
+# LIGHTWEIGHT RAW HISTORY — ALL SKUs, no focus filter, no feature
+# engineering. Used only as the fallback KPI source for leftover
+# (non-focus) SKUs on the Forecast dashboard, since those SKUs never
+# go through preprocess_engine and have no row in processed_data_actual.csv.
+# ============================================================
+def load_raw_actual_history_all_skus() -> pd.DataFrame:
+    """
+    Raw fact_monthly_closed for ALL SKUs (focus filter NOT applied),
+    standardized on month columns only (no lags/rolling stats/regimes —
+    that full feature pipeline is reserved for focus SKUs). Closed
+    months only, same exclusion rule as preprocess_engine.
+    """
+    # Lazy import: avoids a module-load-order dependency between
+    # forecast_service (loaded early) and engines.preprocess_engine.
+    from engines.preprocess_engine import standardize_month_columns, force_itemcode_str
+
+    df = load_raw_data(mode="actual", apply_focus_filter=False)
+    df = standardize_month_columns(df)
+    df = force_itemcode_str(df)
+
+    required = ["ItemCode", "Year", "Month_Number"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"fact_monthly_closed missing columns: {missing}")
+
+    keep_cols = [
+        "ItemCode", "Year", "Month_Number",
+        "Secondary_Sales_Qty", "Free_Qty", "Bonus_Flag",
+        "Available_Primary_Inventory_Qty", "Distributor_Inventory_Qty",
+        "Supply_Constraint_Flag",
+    ]
+    for c in keep_cols:
+        if c not in df.columns:
+            df[c] = 0
+
+    df = df[keep_cols].copy()
+    for c in keep_cols[3:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    df = df.dropna(subset=["ItemCode", "Year", "Month_Number"])
+    df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+    df["Month_Number"] = pd.to_numeric(df["Month_Number"], errors="coerce")
+    df = df.dropna(subset=["Year", "Month_Number"])
+
+    # Exclude any still-open calendar month (same rule used elsewhere)
+    now = datetime.utcnow()
+    current_period = now.year * 12 + now.month
+    period_idx = df["Year"].astype(int) * 12 + df["Month_Number"].astype(int)
+    df = df[period_idx < current_period].copy()
+
+    return (
+        df.groupby(["ItemCode", "Year", "Month_Number"], as_index=False)
+        .sum(numeric_only=True)
+        .sort_values(["ItemCode", "Year", "Month_Number"])
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# COMBINED FORECAST (model + trend, ONE deduped M+1 table)
+# Built by engines/master_forecast_engine.build_combined_forecast_table.
+# Downstream consumers should read this instead of joining
+# forecast_latest.csv + forecast_trend_latest.csv themselves.
+# ============================================================
+def save_forecast_all_skus_latest(df: pd.DataFrame) -> str:
+    df.to_csv(FORECAST_ALL_SKUS_LATEST_PATH, index=False)
+    return FORECAST_ALL_SKUS_LATEST_PATH
+
+
+def load_forecast_all_skus_latest() -> pd.DataFrame:
+    if not os.path.exists(FORECAST_ALL_SKUS_LATEST_PATH):
+        return pd.DataFrame()
+    return pd.read_csv(FORECAST_ALL_SKUS_LATEST_PATH)
+
+
+# ============================================================
+# MASTER-MAPPED FORECAST (sku_master_full.csv as join anchor, with
+# combined M+1 + horizon M+2..M+6 mapped onto every budgeted SKU).
+# Built by engines/master_forecast_engine.build_master_forecast_table.
+# ============================================================
+def save_master_forecast_mapped(df: pd.DataFrame) -> str:
+    df.to_csv(MASTER_FORECAST_OUTPUT_PATH, index=False)
+    return MASTER_FORECAST_OUTPUT_PATH
+
+
+def load_master_forecast_mapped() -> pd.DataFrame:
+    if not os.path.exists(MASTER_FORECAST_OUTPUT_PATH):
+        return pd.DataFrame()
+    return pd.read_csv(MASTER_FORECAST_OUTPUT_PATH)
+
+
+# ============================================================
+# BUDGET MONTHLY SERIES — wide (Apr-26 ... Mar-27) -> long
+# (ItemCode, Month "YYYY-MM", Budget_Qty). Used to overlay the budgeted
+# quantity per month on the Forecast page's sales trend chart, alongside
+# actual / past forecast / future forecast.
+#
+# Only real numeric ItemCodes get a month-by-month split (that's how the
+# budget sheet is structured) — synthetic/placeholder-coded products have
+# no budget series here, same limitation as elsewhere in the pipeline.
+# ============================================================
+_budget_monthly_cache = None
+
+
+def _parse_month_column(col) -> Optional[str]:
+    """
+    Turn a Budget.xlsx month column header into "YYYY-MM", or None if it
+    isn't a month column at all (Agency, ItemCode, BudgetPrice, ...).
+
+    Handles TWO header forms because pandas/openpyxl behavior depends on
+    how the Excel cell itself is formatted:
+      1. Already-parsed datetime-like objects (Timestamp/datetime) — this
+         happens when the header cell has an Excel date format applied,
+         even though it visually reads "Apr-26".
+      2. Literal strings like "Apr-26" / "Apr-2026" — parsed with explicit
+         formats only, never pandas' generic date inference (which
+         misreads "Jan-27" as January 27th of THIS year).
+    """
+    if hasattr(col, "year") and hasattr(col, "month"):
+        try:
+            return f"{int(col.year):04d}-{int(col.month):02d}"
+        except Exception:
+            pass
+
+    s = str(col).strip()
+    for date_fmt in ("%b-%y", "%b-%Y"):
+        try:
+            dt = datetime.strptime(s, date_fmt)
+            return f"{dt.year:04d}-{dt.month:02d}"
+        except ValueError:
+            continue
+    return None
+
+
+def load_budget_monthly_series(force_reload: bool = False) -> pd.DataFrame:
+    """
+    Long-format DataFrame: ItemCode | Month ("YYYY-MM") | Budget_Qty.
+    Cached in memory; pass force_reload=True to re-read the sheet.
+    """
+    global _budget_monthly_cache
+    if _budget_monthly_cache is not None and not force_reload:
+        return _budget_monthly_cache
+
+    out_cols = ["ItemCode", "Month", "Budget_Qty"]
+
+    if not os.path.exists(BUDGET_XLSX_PATH):
+        _budget_monthly_cache = pd.DataFrame(columns=out_cols)
+        return _budget_monthly_cache
+
+    df = pd.read_excel(BUDGET_XLSX_PATH, sheet_name=BUDGET_ALL_SHEET_NAME, header=0)
+    # NOTE: do NOT str()/strip() column names here before parsing — that
+    # would collapse a real Timestamp header down to its string repr
+    # before _parse_month_column gets a chance to read it as a date object.
+    # Only strip whitespace on genuinely string headers.
+    df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+
+    itemcode_col = next((c for c in df.columns if isinstance(c, str) and c in ["ItemCode", "PID", "Code"]), None)
+    if itemcode_col is None:
+        _budget_monthly_cache = pd.DataFrame(columns=out_cols)
+        return _budget_monthly_cache
+
+    month_label_by_col = {}
+    for c in df.columns:
+        label = _parse_month_column(c)
+        if label:
+            month_label_by_col[c] = label
+
+    if not month_label_by_col:
+        _budget_monthly_cache = pd.DataFrame(columns=out_cols)
+        return _budget_monthly_cache
+
+    num = pd.to_numeric(df[itemcode_col], errors="coerce")
+    valid_rows = df[num.notna()].copy()
+    valid_rows["ItemCode"] = num[num.notna()].astype("Int64").astype(str)
+
+    long_frames = []
+    for col, month_label in month_label_by_col.items():
+        qty = pd.to_numeric(valid_rows[col], errors="coerce").fillna(0)
+        long_frames.append(pd.DataFrame({
+            "ItemCode": valid_rows["ItemCode"].values,
+            "Month": month_label,
+            "Budget_Qty": qty.values,
+        }))
+
+    result = pd.concat(long_frames, ignore_index=True) if long_frames else pd.DataFrame(columns=out_cols)
+    _budget_monthly_cache = result
+    return result
+
+
+def get_budget_series_for_sku(item_code: str) -> dict:
+    """Month label ("YYYY-MM") -> Budget_Qty for one SKU. Empty dict if
+    the SKU has no numeric ItemCode in the budget sheet."""
+    df = load_budget_monthly_series()
+    if df.empty:
+        return {}
+    item_key = str(item_code).strip().replace(".0", "")
+    sub = df[df["ItemCode"] == item_key]
+    if sub.empty:
+        return {}
+    return dict(zip(sub["Month"], sub["Budget_Qty"]))

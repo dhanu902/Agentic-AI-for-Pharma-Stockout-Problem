@@ -1,0 +1,2 @@
+fact_monthly_closed --> monthly sales and bonus details + monthend stock for respective month. 
+Inventory --> monthend stock consider as openning stock for next month. ex: April monthend stock, here as May stock

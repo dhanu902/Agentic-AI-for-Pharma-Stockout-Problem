@@ -4,12 +4,16 @@
 #   - Expiry bucket classification from Inventory.xlsx (DB + WH sheets)
 #   - DB (distributor) and WH (warehouse/primary) stock aggregation
 #   - Scenario A/B/C stockout classification against M+1 forecast
+#   - Full master-SKU-universe coverage: every budgeted SKU (real or
+#     synthetic code) gets a row, even with no inventory and/or no
+#     forecast data — missing data is flagged, never silently dropped.
 #
 # Physically available stock ONLY (DB + WH). No pending PO/GRN here —
 # that belongs to horizon_inventory_engine.py (M+1..M+6).
 #
-# NO FILE I/O HERE. Inputs are DataFrames (raw DB/WH sheets + forecast_df)
-# passed in by risk_service; outputs are DataFrames returned to the caller.
+# NO FILE I/O HERE. Inputs are DataFrames (raw DB/WH sheets + forecast_df
+# + optional master SKU list) passed in by risk_service/risk_orchestrator;
+# outputs are DataFrames returned to the caller.
 
 from __future__ import annotations
 
@@ -334,6 +338,7 @@ def build_inventory_risk_snapshot(
     runtime_df: Optional[pd.DataFrame] = None,
     forecast_year: Optional[int] = None,
     forecast_month: Optional[int] = None,
+    master_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Build merged SKU-level inventory risk snapshot/base for the forecast month.
@@ -345,6 +350,23 @@ def build_inventory_risk_snapshot(
 
     No FEFO. Only expiry bucket classification:
         EXPIRED / SHORT_EXP / NO_RISK.
+
+    master_df (optional):
+        Full budgeted SKU universe — columns "ProductCode" (or "ItemCode")
+        and "Is_Synthetic_Code", as produced by
+        services.sku_master_service.load_sku_master_full().
+
+        When supplied, the output is SCOPED to this full master list
+        instead of only SKUs that happen to appear in Inventory.xlsx this
+        month. SKUs with no inventory row get zero-filled stock buckets
+        and Has_Inventory_Data = 0 rather than being silently dropped.
+        Synthetic (no-real-code) SKUs always get Has_Inventory_Data = 0
+        since Inventory.xlsx only ever carries real numeric ItemCodes.
+
+        When NOT supplied (backward compatible), behavior is unchanged:
+        only SKUs present in Inventory.xlsx for the month appear, and
+        Has_Inventory_Data / Is_Synthetic_Code are set to 1 / 0 for all
+        rows.
     """
     run_date = pd.Timestamp(datetime.now().date())
 
@@ -426,6 +448,45 @@ def build_inventory_risk_snapshot(
         merged = pd.DataFrame(columns=["ItemCode"])
 
     # ------------------------------------------------------------
+    # 4.5) Scope to full master SKU universe (all budgeted SKUs), not
+    #      just whichever SKUs happen to have inventory this month.
+    #      SKUs missing from Inventory.xlsx get zero-filled stock
+    #      buckets + Has_Inventory_Data = 0, instead of being dropped
+    #      or silently treated as genuinely zero stock.
+    # ------------------------------------------------------------
+    if master_df is not None and not master_df.empty:
+        master = master_df.copy()
+        if "ProductCode" in master.columns and "ItemCode" not in master.columns:
+            master = master.rename(columns={"ProductCode": "ItemCode"})
+        if "ItemCode" not in master.columns:
+            raise KeyError("master_df must contain 'ItemCode' or 'ProductCode'.")
+
+        master["ItemCode"] = normalize_itemcode(master["ItemCode"])
+        if "Is_Synthetic_Code" not in master.columns:
+            master["Is_Synthetic_Code"] = 0
+        master = (
+            master[["ItemCode", "Is_Synthetic_Code"]]
+            .drop_duplicates(subset=["ItemCode"])
+        )
+
+        had_inventory_codes = set(merged["ItemCode"]) if not merged.empty else set()
+
+        # LEFT anchor on the master list -> every budgeted SKU appears,
+        # even ones with zero rows in Inventory.xlsx this month.
+        merged = master.merge(merged, on="ItemCode", how="left")
+        merged["Has_Inventory_Data"] = merged["ItemCode"].isin(had_inventory_codes).astype(int)
+        merged["Is_Synthetic_Code"] = (
+            pd.to_numeric(merged["Is_Synthetic_Code"], errors="coerce").fillna(0).astype(int)
+        )
+    else:
+        # Backward-compatible path: no master scope supplied.
+        merged["Has_Inventory_Data"] = 1
+        merged["Is_Synthetic_Code"] = 0
+
+    if merged.empty:
+        merged = pd.DataFrame(columns=["ItemCode"])
+
+    # ------------------------------------------------------------
     # 5) Add context columns
     # ------------------------------------------------------------
     merged["Run_Date"] = str(run_date.date())
@@ -476,6 +537,8 @@ def build_inventory_risk_snapshot(
         "Forecast_Month",
         "Cutoff_Date",
         "ItemCode",
+        "Has_Inventory_Data",
+        "Is_Synthetic_Code",
         "Distributor_Total_Qty",
         "Distributor_NoRisk_Qty",
         "Distributor_ShortExp_Qty",
@@ -685,6 +748,41 @@ def classify_risk(A: ScenarioResult, B: ScenarioResult, C: ScenarioResult) -> st
     return "CRITICAL_STOCKOUT"
 
 
+def classify_risk_with_data_flags(
+    A: ScenarioResult,
+    B: ScenarioResult,
+    C: ScenarioResult,
+    has_inventory: bool,
+    has_forecast: bool,
+    is_synthetic: bool,
+) -> str:
+    """
+    Wraps classify_risk() with data-completeness awareness so missing data
+    is labeled honestly instead of masquerading as a real risk assessment.
+
+    Precedence (most certain override first):
+        1. Synthetic/no-real-code SKU -> NOT_TRACKED
+           (no physical ItemCode exists, so no inventory record ever can)
+        2. No inventory AND no forecast -> NO_DATA
+        3. No inventory, but has forecast -> NO_INVENTORY_DATA
+           (do NOT auto-report CRITICAL_STOCKOUT here — a missing
+           inventory row may be a data gap, not confirmed zero stock)
+        4. Has inventory, but no forecast -> NO_FORECAST_DATA
+           (scenarios were computed with Forecast_Qty=0, trivially "safe",
+           but tagged so it isn't confused with a real assessment)
+        5. Both present -> normal A/B/C scenario classification
+    """
+    if is_synthetic:
+        return "NOT_TRACKED"
+    if not has_inventory and not has_forecast:
+        return "NO_DATA"
+    if not has_inventory:
+        return "NO_INVENTORY_DATA"
+    if not has_forecast:
+        return "NO_FORECAST_DATA"
+    return classify_risk(A, B, C)
+
+
 # ============================================================
 # MAIN BUILD — M+1 risk table (physical stock only)
 # ============================================================
@@ -699,6 +797,12 @@ def build_risk_table(
     """
     Build M+1 stockout risk table from physical stock (base_df, output of
     build_inventory_risk_snapshot) + M+1 forecast (forecast_df).
+
+    base_df is treated as the ANCHOR (LEFT join), so every SKU it carries
+    — the full master universe if build_inventory_risk_snapshot was given
+    master_df, otherwise whatever base_df contains — gets a row even if
+    forecast_df has no matching entry (Has_Forecast_Data=0, Forecast_Qty
+    defaults to 0).
 
     No pending PO/GRN supply deduction here — see horizon_inventory_engine
     for the M+1..M+6 path that includes pending supply.
@@ -724,13 +828,26 @@ def build_risk_table(
     base_df[item_col] = normalize_itemcode(base_df[item_col])
     forecast_df[item_col] = normalize_itemcode(forecast_df[item_col])
 
-    keep_forecast_cols = [item_col, forecast_col]
+    # Data-completeness flags default to 1/0 when build_inventory_risk_snapshot
+    # wasn't given a master_df (backward compatible — everything in base_df
+    # is assumed to have real inventory data by definition in that path).
+    if "Has_Inventory_Data" not in base_df.columns:
+        base_df["Has_Inventory_Data"] = 1
+    if "Is_Synthetic_Code" not in base_df.columns:
+        base_df["Is_Synthetic_Code"] = 0
 
+    keep_forecast_cols = [item_col, forecast_col]
+    forecast_df["_Has_Forecast_Data"] = 1
+
+    # LEFT merge on base_df: every SKU base_df carries survives, whether or
+    # not forecast_df has a matching row.
     merged = base_df.merge(
-        forecast_df[keep_forecast_cols],
+        forecast_df[keep_forecast_cols + ["_Has_Forecast_Data"]],
         on=item_col,
-        how="inner",
+        how="left",
     )
+    merged["_Has_Forecast_Data"] = merged["_Has_Forecast_Data"].fillna(0).astype(int)
+    merged[forecast_col] = pd.to_numeric(merged[forecast_col], errors="coerce").fillna(0)
 
     run_id = now_run_id()
     out_rows = []
@@ -741,6 +858,10 @@ def build_risk_table(
         forecast_month = safe_value(r.get(forecast_month_col))
 
         F = safe_float(r[forecast_col])
+
+        has_inventory = bool(int(r.get("Has_Inventory_Data", 1)))
+        has_forecast = bool(int(r.get("_Has_Forecast_Data", 0)))
+        is_synthetic = bool(int(r.get("Is_Synthetic_Code", 0)))
 
         # Distributor buckets
         db_no_risk = safe_float(r.get("Distributor_NoRisk_Qty", 0))
@@ -769,7 +890,12 @@ def build_risk_table(
             blocked_qty,
         )
 
-        risk_level = classify_risk(A, B, C)
+        risk_level = classify_risk_with_data_flags(
+            A, B, C,
+            has_inventory=has_inventory,
+            has_forecast=has_forecast,
+            is_synthetic=is_synthetic,
+        )
 
         out_rows.append({
             "run_id": run_id,
@@ -778,6 +904,11 @@ def build_risk_table(
             "ItemCode": item,
 
             "Forecast_Qty": F,
+
+            # ── data completeness flags ────────────────────────
+            "Has_Inventory_Data": int(has_inventory),
+            "Has_Forecast_Data": int(has_forecast),
+            "Is_Synthetic_Code": int(is_synthetic),
 
             # ── stock buckets ──────────────────────────────────
             "Distributor_NoRisk_Qty": db_no_risk,

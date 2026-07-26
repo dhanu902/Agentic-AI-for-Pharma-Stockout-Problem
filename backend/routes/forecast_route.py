@@ -5,6 +5,7 @@ from flask import Blueprint, request, jsonify
 from engines.forecast_orchestrator import (
     get_dashboard,
     get_skus,
+    get_skus_full,
     reload_data_now,
     reload_model_artifacts,
     refresh_model_now,
@@ -100,3 +101,7 @@ def export_forecast_horizon():
 def health():
     payload, status = get_health()
     return jsonify(payload), status
+
+@forecast_bp.route("/skus_full", methods=["GET"])
+def skus_full():
+    return jsonify({"skus": get_skus_full()}), 200
