@@ -1,5 +1,7 @@
 /*Dashboard -> src -> pages -> Forecast.jsx */
 // UI v2 — visual upgrade only. All state, fetch, memo and chart logic unchanged.
+// v2.1 — adds /skus_full dropdown (includes leftover/non-focus SKUs) and
+//        data_completeness: "LIGHTWEIGHT" handling for the fallback dashboard.
 
 import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -152,20 +154,32 @@ const Badge = ({ label, color }) => (
 );
 
 /* ─── SKU Info Strip ─────────────────────────────────────────── */
+/* NEW: shows product_name/agency (present for leftover SKUs, and for
+   focus SKUs if the backend ever attaches them) and a "Limited data"
+   badge when the backend fell back to the lightweight dashboard. */
 const SkuInfoStrip = ({ result }) => {
   if (!result || result.error) return null;
-  const abcCat    = result.abc_category;
-  const abcCol    = abcColor(abcCat);
-  const demStatus = result.demand_status;
-  const demCol    = demandStatusColor(demStatus);
-  const segment   = result.segment;
+  const abcCat       = result.abc_category;
+  const abcCol       = abcColor(abcCat);
+  const demStatus    = result.demand_status;
+  const demCol       = demandStatusColor(demStatus);
+  const segment      = result.segment;
+  const isLightweight = result.data_completeness === "LIGHTWEIGHT";
   return (
     <div className="ui-anim" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "9px 16px", background: `linear-gradient(135deg, ${T.card}F2, ${T.card}D9)`, backdropFilter: "blur(8px)", border: `1px solid ${T.border}`, borderRadius: 12, marginBottom: 18, boxShadow: SHADOW_SM }}>
       <span style={{ fontSize: 13, fontWeight: 900, color: T.text, fontFamily: FONT_MONO, letterSpacing: 0.5 }}>{result.item_code || result.ItemCode || "—"}</span>
+      {result.product_name && (<>
+        <span style={{ color: T.borderHi, fontSize: 14 }}>·</span>
+        <span style={{ fontSize: 12, color: T.text, fontWeight: 600 }}>{result.product_name}</span>
+      </>)}
+      {result.agency && (
+        <span style={{ fontSize: 11, color: T.muted }}>({result.agency})</span>
+      )}
       <span style={{ color: T.borderHi, fontSize: 14 }}>·</span>
       {abcCat && <span style={{ display: "inline-flex", alignItems: "center", background: abcCol + "14", border: `1px solid ${abcCol}3A`, borderRadius: 999, padding: "3px 10px", fontSize: 10, fontWeight: 800, color: abcCol, textTransform: "uppercase", letterSpacing: 1 }}>ABC · {abcCat}</span>}
       {demStatus && <span style={{ display: "inline-flex", alignItems: "center", background: demCol + "14", border: `1px solid ${demCol}3A`, borderRadius: 999, padding: "3px 10px", fontSize: 10, fontWeight: 700, color: demCol }}>{demStatus}</span>}
       {segment && <span style={{ display: "inline-flex", alignItems: "center", background: T.blue + "14", border: `1px solid ${T.blue}3A`, borderRadius: 999, padding: "3px 10px", fontSize: 10, fontWeight: 700, color: T.blue, textTransform: "uppercase", letterSpacing: 0.8 }}>Seg: {segment}</span>}
+      {isLightweight && <Badge label="Limited data" color={T.amber} />}
       {result.as_of && <span style={{ marginLeft: "auto", fontSize: 10, color: T.muted }}>As of <span style={{ color: T.text, fontWeight: 700 }}>{result.as_of}</span></span>}
     </div>
   );
@@ -224,11 +238,14 @@ export default function Forecast() {
     if (sku && !forecastMemory.result) { setItemCode(sku); handleForecast(sku); }
   }, []);
 
+  // CHANGED: /skus -> /skus_full, so leftover (non-focus) SKUs are
+  // selectable too. Response shape is now [{item_code, is_focus}, ...]
+  // instead of a plain string list.
   useEffect(() => {
     const loadSkus = async () => {
       setSkuLoading(true);
       try {
-        const res  = await fetch(`${API_BASE}/skus`);
+        const res  = await fetch(`${API_BASE}/skus_full`);
         const data = await res.json().catch(() => ({}));
         if (res.ok) setSkuOptions(data?.skus || []);
       } catch {} finally { setSkuLoading(false); }
@@ -242,6 +259,10 @@ export default function Forecast() {
 
   const mom         = result?.mom_change;
   const momPositive = typeof mom === "number" ? mom > 0 : false;
+
+  // NEW: true when the backend used the leftover-SKU fallback path
+  // (no preprocessing, no engineered features — see leftover_sku_engine).
+  const isLightweight = result?.data_completeness === "LIGHTWEIGHT";
 
   const forecastSplitLabel = useMemo(() => {
     if (!salesTrend?.length) return null;
@@ -293,7 +314,8 @@ export default function Forecast() {
               placeholder={skuLoading ? "Loading SKUs..." : "SKU / Item Code…"}
               onKeyDown={e => e.key === "Enter" && handleForecast()}
               style={{ background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 13, width: "100%", fontFamily: FONT_MONO }} />
-            <datalist id="sku-options">{skuOptions.map(s => <option key={s} value={s} />)}</datalist>
+            {/* CHANGED: skuOptions is now [{item_code, is_focus}], render item_code */}
+            <datalist id="sku-options">{skuOptions.map(s => <option key={s.item_code} value={s.item_code} />)}</datalist>
           </div>
           <button className="ui-btn" onClick={() => handleForecast()} disabled={loading}
             style={{ background: loading ? T.subtle : `linear-gradient(135deg, ${T.blue}, ${T.teal})`, border: "none", color: loading ? T.muted : "#fff", fontWeight: 800, fontSize: 13, borderRadius: 10, padding: "11px 20px", cursor: loading ? "not-allowed" : "pointer", fontFamily: FONT_UI, letterSpacing: 0.3, boxShadow: loading ? "none" : `0 8px 18px -8px ${T.blue}AA`, display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -308,19 +330,28 @@ export default function Forecast() {
         <div style={{ background: T.red + "0D", border: `1px solid ${T.red}33`, borderLeft: `4px solid ${T.red}`, borderRadius: 12, padding: "13px 18px", color: T.red, marginBottom: 20, fontSize: 13, boxShadow: SHADOW_SM }}>⚠ {result.error}</div>
       )}
 
+      {/* NEW: explains why several sections are hidden/blank for leftover SKUs */}
+      {result && !result.error && isLightweight && (
+        <div style={{ background: T.amber + "0D", border: `1px solid ${T.amber}33`, borderLeft: `4px solid ${T.amber}`, borderRadius: 12, padding: "13px 18px", color: T.amber, marginBottom: 20, fontSize: 12.5, boxShadow: SHADOW_SM }}>
+          ⓘ This SKU is outside the AI model's focus list. Showing available sales history and a trend-baseline forecast only — inventory, stock cover, and shock signals aren't available for it.
+        </div>
+      )}
+
       {result && !result.error && (<>
         <div className="hero-grid">
           <div className="kpi-stack">
             <KPICard label="Next Month Forecast"  value={fmt(result.next_month_forecast)}  sub={result.next_month_label}   accent={T.blue}   icon="📈" />
             <KPICard label="Current Month Actual"  value={fmt(result.current_month_actual)} sub={result.current_month_label} accent={T.green}  icon="✓" />
             <KPICard label="MoM Change" value={typeof mom === "number" ? `${momPositive ? "+" : ""}${fmt(mom)}%` : "—"} sub={typeof mom === "number" ? (momPositive ? "▲ Growing" : "▼ Declining") : "No previous baseline"} accent={typeof mom === "number" ? (momPositive ? T.green : T.red) : T.muted} icon={typeof mom === "number" ? (momPositive ? "↑" : "↓") : "—"}/>
-            <KPICard label="L3M Moving AVG" value={result.current_l3m_avg != null? fmt(Math.round(result.current_l3m_avg)): "—"} sub="Business demand baseline" accent={T.purple} icon="∅" />
+            {!isLightweight && (
+              <KPICard label="L3M Moving AVG" value={result.current_l3m_avg != null? fmt(Math.round(result.current_l3m_avg)): "—"} sub="Business demand baseline" accent={T.purple} icon="∅" />
+            )}
           </div>
 
           <Panel>
             <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
               <SectionHeader title="Sales Trend — Actual vs Forecast" subtitle="Past 12 months Clean_Demand + 6-month forecast horizon" />
-              <div style={{ display: "flex", gap: 6 }}><Badge label="Actual" color={T.green} /><Badge label="Forecast" color={T.blue} /></div>
+              <div style={{ display: "flex", gap: 6 }}><Badge label="Actual" color={T.green} /><Badge label="Forecast" color={T.blue} /><Badge label="Budget" color={T.muted} /></div>
             </div>
             <ResponsiveContainer width="100%" height={280}>
               <ComposedChart data={horizonTrend} margin={{ top: 10, right: 16, bottom: 0, left: 0 }}>
@@ -335,6 +366,7 @@ export default function Forecast() {
                 <YAxis tick={{ fill: T.muted, fontSize: 10, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} width={40} tickFormatter={fmtK} />
                 <Tooltip content={<CustomTooltip />} />
                 {forecastSplitLabel && <ReferenceLine x={forecastSplitLabel} stroke={T.blue} strokeDasharray="5 4" strokeOpacity={0.6} label={{ value: "▶ Forecast", fill: T.blue, fontSize: 10, fontWeight: 700, position: "insideTopRight" }} />}
+                <Line dataKey="budget" name="Budget" stroke={T.muted} strokeWidth={1.8} strokeDasharray="2 3" dot={false} connectNulls={false} />
                 <Area dataKey="predicted" name="Predicted" fill="url(#predGrad)" stroke={T.blue} strokeWidth={2.5} strokeDasharray="7 4" dot={false} connectNulls={false} />
                 <Line dataKey="pastForecast" name="Past Forecast" stroke={T.purple} strokeWidth={2.2} strokeDasharray="4 4" dot={{ r: 3, fill: T.purple, strokeWidth: 0 }}connectNulls={false}/>
                 <Line dataKey="actual" name="Actual" stroke={T.green} strokeWidth={2.5} dot={{ r: 3, fill: T.green, strokeWidth: 0 }} activeDot={{ r: 6, fill: T.green, stroke: T.bg, strokeWidth: 2 }} connectNulls={false} />
@@ -343,49 +375,57 @@ export default function Forecast() {
           </Panel>
         </div>
 
-        <Divider label="Business Signals" />
-        <div className="signal-row">
-          <SignalCard label="Last Month Actual"         value={fmt(result.last_month_actual)}sub={result.last_month_label}accent={T.teal}/>
-          <SignalCard label="Bonus Qty (Cur | Last)"    value={`${fmt(latestShock?.bonusQty)} / ${fmt(previousShock?.bonusQty)}`}sub={`Flag: ${fmt(latestShock?.bonusFlag)} / ${fmt(previousShock?.bonusFlag)}`}accent={T.amber}/>
-          <SignalCard label="Supply Shock (Cur | Last)" value={`${fmt(latestShock?.supplyFlag)} / ${fmt(previousShock?.supplyFlag)}`}sub="Recent stockout indicators"accent={T.red}/>
-          <SignalCard label="Current DB SHP"            value={result.current_db_shp != null ? result.current_db_shp.toFixed(2): "—"}sub={`Stock: ${fmt(result.current_db_stock)}`}accent={T.purple}/>
-          <SignalCard label="Current WH SHP"            value={result.current_wh_shp != null ? result.current_wh_shp.toFixed(2): "—"}sub={`Stock: ${fmt(result.current_wh_stock)}`}accent={T.teal}/>
-        </div>
+        {/* CHANGED: Business Signals row needs stock/SHP/shock fields that
+            don't exist for lightweight SKUs — hide instead of showing blanks. */}
+        {!isLightweight && (<>
+          <Divider label="Business Signals" />
+          <div className="signal-row">
+            <SignalCard label="Last Month Actual"         value={fmt(result.last_month_actual)}sub={result.last_month_label}accent={T.teal}/>
+            <SignalCard label="Bonus Qty (Cur | Last)"    value={`${fmt(latestShock?.bonusQty)} / ${fmt(previousShock?.bonusQty)}`}sub={`Flag: ${fmt(latestShock?.bonusFlag)} / ${fmt(previousShock?.bonusFlag)}`}accent={T.amber}/>
+            <SignalCard label="Supply Shock (Cur | Last)" value={`${fmt(latestShock?.supplyFlag)} / ${fmt(previousShock?.supplyFlag)}`}sub="Recent stockout indicators"accent={T.red}/>
+            <SignalCard label="Current DB SHP"            value={result.current_db_shp != null ? result.current_db_shp.toFixed(2): "—"}sub={`Stock: ${fmt(result.current_db_stock)}`}accent={T.purple}/>
+            <SignalCard label="Current WH SHP"            value={result.current_wh_shp != null ? result.current_wh_shp.toFixed(2): "—"}sub={`Stock: ${fmt(result.current_wh_stock)}`}accent={T.teal}/>
+          </div>
+        </>)}
 
-        <Divider label="Market Signals" />
-        <div className="bottom-grid">
-          <Panel>
-            <SectionHeader title="Inventory Positions" subtitle="Primary inventory vs distributor stock — past 12 months" />
-            <ResponsiveContainer width="100%" height={230}>
-              <ComposedChart data={inventoryTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} interval={3} />
-                <YAxis tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
-                <Line dataKey="primaryInventory" name="Primary Inventory" stroke={T.purple} strokeWidth={2} dot={false} />
-                <Line dataKey="distInventory" name="Distributor Stock" stroke={T.amber} strokeWidth={2} dot={false} strokeDasharray="5 3" />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </Panel>
+        {/* CHANGED: Inventory/shock charts need engineered fields that don't
+            exist for lightweight SKUs — hide instead of rendering empty charts. */}
+        {!isLightweight && (<>
+          <Divider label="Market Signals" />
+          <div className="bottom-grid">
+            <Panel>
+              <SectionHeader title="Inventory Positions" subtitle="Primary inventory vs distributor stock — past 12 months" />
+              <ResponsiveContainer width="100%" height={230}>
+                <ComposedChart data={inventoryTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} interval={3} />
+                  <YAxis tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
+                  <Line dataKey="primaryInventory" name="Primary Inventory" stroke={T.purple} strokeWidth={2} dot={false} />
+                  <Line dataKey="distInventory" name="Distributor Stock" stroke={T.amber} strokeWidth={2} dot={false} strokeDasharray="5 3" />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </Panel>
 
-          <Panel>
-            <SectionHeader title="Bonus & Demand Shock Events" subtitle="Free_Qty per month + disruption flags — past 12 months" />
-            <ResponsiveContainer width="100%" height={230}>
-              <ComposedChart data={shockTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
-                <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} interval={3} />
-                <YAxis yAxisId="left" tick={{ fill: T.muted, fontSize: 9 }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
-                <YAxis yAxisId="right" orientation="right" domain={[0, 1.5]} hide />
-                <Tooltip content={<CustomTooltip />} />
-                <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
-                <Bar yAxisId="left"  dataKey="bonusQty"   name="Bonus Qty"    fill={T.amber} opacity={0.85} maxBarSize={16} radius={[3,3,0,0]} />
-                <Bar yAxisId="right" dataKey="bonusFlag"  name="Bonus Flag"   fill="#c47d18" opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
-                <Bar yAxisId="right" dataKey="supplyFlag" name="Supply Shock" fill={T.red}   opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </Panel>
-        </div>
+            <Panel>
+              <SectionHeader title="Bonus & Demand Shock Events" subtitle="Free_Qty per month + disruption flags — past 12 months" />
+              <ResponsiveContainer width="100%" height={230}>
+                <ComposedChart data={shockTrend} margin={{ top: 6, right: 10, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: T.muted, fontSize: 9, fontFamily: FONT_MONO }} tickLine={false} axisLine={false} interval={3} />
+                  <YAxis yAxisId="left" tick={{ fill: T.muted, fontSize: 9 }} tickLine={false} axisLine={false} width={42} tickFormatter={fmtK} />
+                  <YAxis yAxisId="right" orientation="right" domain={[0, 1.5]} hide />
+                  <Tooltip content={<CustomTooltip />} />
+                  <Legend wrapperStyle={{ fontSize: 10, color: T.muted, paddingTop: 8 }} iconType="circle" iconSize={7} />
+                  <Bar yAxisId="left"  dataKey="bonusQty"   name="Bonus Qty"    fill={T.amber} opacity={0.85} maxBarSize={16} radius={[3,3,0,0]} />
+                  <Bar yAxisId="right" dataKey="bonusFlag"  name="Bonus Flag"   fill="#c47d18" opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
+                  <Bar yAxisId="right" dataKey="supplyFlag" name="Supply Shock" fill={T.red}   opacity={0.7}  maxBarSize={10} radius={[3,3,0,0]} />
+                </ComposedChart>
+              </ResponsiveContainer>
+            </Panel>
+          </div>
+        </>)}
 
         <Divider label="Model & Routing Details" />
         <div className="ui-anim" style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: "18px 20px", marginBottom: 16, boxShadow: SHADOW_MD, position: "relative", overflow: "hidden" }}>

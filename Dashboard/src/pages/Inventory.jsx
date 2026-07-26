@@ -4,6 +4,14 @@
 // SKU detail header so planners can see how much confirmed incoming
 // stock was deducted from gross forecast demand before scenarios ran.
 // UI v2 — visual upgrade only. All logic unchanged.
+//
+// UPDATE: full master SKU universe support. New Risk_Level values
+// (NO_FORECAST_DATA, NO_INVENTORY_DATA, NO_DATA, NOT_TRACKED) are
+// data-completeness states, not risk verdicts — they get their own
+// visual treatment, their own summary strip, filter options, per-row
+// flags, and a plain-language explanation banner in the detail view.
+// Scenario A/B/C cards are suppressed for these rows since the
+// underlying numbers are trivial (e.g. 0 forecast trivially "met").
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -25,7 +33,21 @@ const RISK_CONFIG = {
   WH_INSPECTION_REQUIRED: { color: T.red,     label: "Critical: WH Inspection Required", icon: "!" },
   WH_BLOCKED_REQUIRED:    { color: T.crimson, label: "Critical: WH Blocked Required", icon: "✕" },
   CRITICAL_STOCKOUT:      { color: T.red,     label: "Critical Stockout",             icon: "✕" },
+  // Data-completeness states — informational, NOT a risk verdict.
+  // Kept visually distinct (blue/muted) so planners never mistake
+  // "we have no data" for "confirmed safe" or "confirmed critical".
+  NO_FORECAST_DATA:       { color: T.blue,    label: "No Forecast Data",               icon: "◌" },
+  NO_INVENTORY_DATA:      { color: T.blue,    label: "No Inventory Data",              icon: "◌" },
+  NO_DATA:                { color: T.muted,   label: "No Data Available",             icon: "–" },
+  NOT_TRACKED:            { color: T.muted,   label: "Not Tracked (No Physical Code)", icon: "–" },
 };
+
+// Rows in these states never ran a real scenario assessment — the
+// backend still computes A/B/C for transparency, but the numbers are
+// trivial (e.g. 0 forecast trivially "met"), so the UI must not present
+// them as a genuine risk verdict.
+const DATA_GAP_LEVELS = ["NO_FORECAST_DATA", "NO_INVENTORY_DATA", "NO_DATA", "NOT_TRACKED"];
+function isDataGap(level) { return DATA_GAP_LEVELS.includes(level); }
 
 function getRisk(level) {
   return RISK_CONFIG[level] || { color: T.muted, label: level || "Unknown", icon: "?" };
@@ -328,6 +350,10 @@ export default function RiskPage() {
     whInspection: rows.filter(r => r.Risk_Level === "WH_INSPECTION_REQUIRED").length,
     whBlocked:    rows.filter(r => r.Risk_Level === "WH_BLOCKED_REQUIRED").length,
     critical:     rows.filter(r => r.Risk_Level === "CRITICAL_STOCKOUT").length,
+    noForecast:   rows.filter(r => r.Risk_Level === "NO_FORECAST_DATA").length,
+    noInventory:  rows.filter(r => r.Risk_Level === "NO_INVENTORY_DATA").length,
+    noData:       rows.filter(r => r.Risk_Level === "NO_DATA").length,
+    notTracked:   rows.filter(r => r.Risk_Level === "NOT_TRACKED").length,
   }), [rows]);
 
   /* ── API calls ── */
@@ -433,8 +459,8 @@ export default function RiskPage() {
         </div>
       )}
 
-      {/* ── Summary badges ── */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap" }}>
+      {/* ── Summary badges: real risk verdicts ── */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
         {[
           { label: "Safe",          count: summary.safe,         color: T.green,   key: "SAFE" },
           { label: "Under Risk",    count: summary.underRisk,    color: T.amber,   key: "UNDER_RISK" },
@@ -443,6 +469,24 @@ export default function RiskPage() {
           { label: "WH Blocked",    count: summary.whBlocked,    color: T.crimson, key: "WH_BLOCKED_REQUIRED" },
           { label: "Critical",      count: summary.critical,     color: T.red,     key: "CRITICAL_STOCKOUT" },
           { label: "Total SKUs",    count: rows.length,          color: T.blue,    key: "ALL" },
+        ].map(({ label, count, color, key }) => (
+          <SummaryBadge key={key} label={label} count={count} color={color}
+            active={riskFilter === key}
+            onClick={() => setRiskFilter(prev => prev === key ? "ALL" : key)} />
+        ))}
+      </div>
+
+      {/* ── Summary badges: data-completeness gaps (not a risk verdict) ── */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 9.5, color: T.muted, textTransform: "uppercase",
+          letterSpacing: 1.4, fontWeight: 800, marginRight: 2 }}>
+          Data Coverage
+        </span>
+        {[
+          { label: "No Forecast",  count: summary.noForecast,  color: T.blue,  key: "NO_FORECAST_DATA" },
+          { label: "No Inventory", count: summary.noInventory, color: T.blue,  key: "NO_INVENTORY_DATA" },
+          { label: "No Data",      count: summary.noData,      color: T.muted, key: "NO_DATA" },
+          { label: "Not Tracked",  count: summary.notTracked,  color: T.muted, key: "NOT_TRACKED" },
         ].map(({ label, count, color, key }) => (
           <SummaryBadge key={key} label={label} count={count} color={color}
             active={riskFilter === key}
@@ -526,6 +570,10 @@ export default function RiskPage() {
                 <option value="WH_INSPECTION_REQUIRED">Critical: WH Inspection Required</option>
                 <option value="WH_BLOCKED_REQUIRED">Critical: WH Blocked Required</option>
                 <option value="CRITICAL_STOCKOUT">Critical Stockout</option>
+                <option value="NO_FORECAST_DATA">No Forecast Data</option>
+                <option value="NO_INVENTORY_DATA">No Inventory Data</option>
+                <option value="NO_DATA">No Data Available</option>
+                <option value="NOT_TRACKED">Not Tracked (No Physical Code)</option>
               </select>
             </div>
 
@@ -551,6 +599,25 @@ export default function RiskPage() {
                         <span style={{ fontWeight: 900, fontSize: 13, color: T.text, fontFamily: FONT_MONO }}>{row.ItemCode}</span>
                         <RiskBadge level={row.Risk_Level} />
                       </div>
+                      {(row.Is_Synthetic_Code === 1 || row.Has_Inventory_Data === 0 || row.Has_Forecast_Data === 0) && (
+                        <div style={{ display: "flex", gap: 5, marginBottom: 8, flexWrap: "wrap" }}>
+                          {row.Is_Synthetic_Code === 1 && (
+                            <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
+                              background: T.muted + "14", border: `1px solid ${T.muted}33`, color: T.muted,
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Physical Code</span>
+                          )}
+                          {row.Is_Synthetic_Code !== 1 && row.Has_Inventory_Data === 0 && (
+                            <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
+                              background: T.blue + "14", border: `1px solid ${T.blue}33`, color: T.blue,
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Inventory Data</span>
+                          )}
+                          {row.Has_Forecast_Data === 0 && (
+                            <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
+                              background: T.blue + "14", border: `1px solid ${T.blue}33`, color: T.blue,
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Forecast Data</span>
+                          )}
+                        </div>
+                      )}
                       <div style={{ display: "flex", gap: 16 }}>
                         <div>
                           <div style={{ fontSize: 9, color: T.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 2 }}>Forecast Qty</div>
@@ -600,6 +667,20 @@ export default function RiskPage() {
                     <RiskBadge level={selectedRow.Risk_Level} />
                   </div>
 
+                  {(selectedRow.Is_Synthetic_Code === 1 || selectedRow.Has_Inventory_Data === 0 || selectedRow.Has_Forecast_Data === 0) && (
+                    <div style={{ marginBottom: 16, padding: "9px 13px", borderRadius: 10,
+                      background: T.blue + "0D", border: `1px solid ${T.blue}2E`, color: T.blue,
+                      fontSize: 11, fontWeight: 600, lineHeight: 1.5 }}>
+                      {selectedRow.Is_Synthetic_Code === 1
+                        ? "This SKU has no real ItemCode yet (budget placeholder) — physical stock can't be tracked, so no risk assessment applies."
+                        : selectedRow.Has_Inventory_Data === 0 && selectedRow.Has_Forecast_Data === 0
+                        ? "No inventory record and no forecast found for this SKU this month — nothing to assess yet."
+                        : selectedRow.Has_Inventory_Data === 0
+                        ? "No inventory record found for this SKU this month. Stock buckets below are shown as zero, but this may reflect a data gap rather than confirmed zero stock."
+                        : "No forecast found for this SKU this month — scenario results below assume zero demand."}
+                    </div>
+                  )}
+
                   {/* FIXED: 6-cell grid — added Incoming Supply and Net Demand
                       so the supply deduction context is visible alongside scenario unmet values */}
                   <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, flexWrap: "wrap" }}>
@@ -625,19 +706,26 @@ export default function RiskPage() {
                 </div>
 
                 <Divider label="Scenario Analysis" />
-                <div className="risk-scenarios">
-                  <ScenarioCard title="Scenario A" tag="DB No-Risk Only"
-                    step="A" scenario={scenarioA} accent={T.green}
-                    isActive={selectedRow.Risk_Level === "SAFE"} showWH={false} />
-                  <ScenarioCard title="Scenario B" tag="DB Trade"
-                    step="B" scenario={scenarioB} accent={T.amber}
-                    isActive={selectedRow.Risk_Level === "UNDER_RISK"} showWH={false} />
-                  <ScenarioCard title="Scenario C" tag="DB + WH Stock"
-                    step="C" scenario={scenarioC}
-                    accent={selectedRow.Risk_Level === "CRITICAL_STOCKOUT" ? T.red : T.orange}
-                    isActive={["WH_TRADE_REQUIRED","WH_INSPECTION_REQUIRED","WH_BLOCKED_REQUIRED","CRITICAL_STOCKOUT"].includes(selectedRow.Risk_Level)}
-                    showWH={true} />
-                </div>
+                {isDataGap(selectedRow.Risk_Level) ? (
+                  <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16,
+                    padding: "26px 20px", color: T.muted, fontSize: 12, textAlign: "center", boxShadow: SHADOW_SM }}>
+                    Scenario analysis isn't meaningful for this SKU yet — {riskLabel(selectedRow.Risk_Level).toLowerCase()}.
+                  </div>
+                ) : (
+                  <div className="risk-scenarios">
+                    <ScenarioCard title="Scenario A" tag="DB No-Risk Only"
+                      step="A" scenario={scenarioA} accent={T.green}
+                      isActive={selectedRow.Risk_Level === "SAFE"} showWH={false} />
+                    <ScenarioCard title="Scenario B" tag="DB Trade"
+                      step="B" scenario={scenarioB} accent={T.amber}
+                      isActive={selectedRow.Risk_Level === "UNDER_RISK"} showWH={false} />
+                    <ScenarioCard title="Scenario C" tag="DB + WH Stock"
+                      step="C" scenario={scenarioC}
+                      accent={selectedRow.Risk_Level === "CRITICAL_STOCKOUT" ? T.red : T.orange}
+                      isActive={["WH_TRADE_REQUIRED","WH_INSPECTION_REQUIRED","WH_BLOCKED_REQUIRED","CRITICAL_STOCKOUT"].includes(selectedRow.Risk_Level)}
+                      showWH={true} />
+                  </div>
+                )}
               </>
             )}
           </div>

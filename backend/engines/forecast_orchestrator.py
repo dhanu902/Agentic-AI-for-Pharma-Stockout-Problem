@@ -20,6 +20,12 @@ from services.forecast_service import (
     load_fact_history_all_skus,
     save_trend_forecast_latest,
     append_trend_forecast_history,
+    load_trend_forecast_latest,
+    save_forecast_all_skus_latest,
+    save_master_forecast_mapped,
+    load_master_forecast_mapped,
+    load_raw_actual_history_all_skus,
+    get_budget_series_for_sku,
 )
 
 from services.horizon_service import (
@@ -28,13 +34,21 @@ from services.horizon_service import (
     load_forecast_horizon_history,
 )
 
+from services.sku_master_service import load_sku_master_full, get_sku_display_info
+
 from engines.preprocess_engine import (
     build_processed_data_from_raw,
     normalize_itemcode,
 )
 
+from engines.master_forecast_engine import (
+    build_combined_forecast_table,
+    build_master_forecast_table,
+)
+
 from services.artifact_service import artifact_service
-from engines.demand_forecast_engine import forecast_one_sku, build_trend_forecast_table
+from engines.demand_forecast_engine import forecast_one_sku
+from engines.leftover_sku_engine import build_trend_forecast_table, build_lightweight_dashboard
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(BASE_DIR)
@@ -150,6 +164,24 @@ def _get_sku_df(item_code: str) -> pd.DataFrame:
     if {"Year", "Month_Number"}.issubset(sku_df.columns):
         sku_df = sku_df.sort_values(["Year", "Month_Number"])
     return sku_df.reset_index(drop=True)
+
+
+def _get_leftover_sku_history(item_code: str) -> pd.DataFrame:
+    """
+    Raw (non-preprocessed) sales/inventory history for a single SKU,
+    used only when the SKU has no row in the preprocessed focus data.
+    """
+    try:
+        hist = load_raw_actual_history_all_skus()
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+    if hist.empty:
+        return hist
+
+    item_key = str(item_code).strip().replace(".0", "")
+    sku_hist = hist[hist["ItemCode"] == item_key].copy()
+    return sku_hist.sort_values(["Year", "Month_Number"]).reset_index(drop=True)
 
 
 # ============================================================
@@ -582,6 +614,16 @@ def _build_dashboard_response(item_code: str):
             "isForecast": True,
         }
 
+    # ============================================================
+    # BUDGET OVERLAY — merge monthly budgeted qty into the sales trend
+    # so the chart can show actual / past forecast / future forecast /
+    # budget together. Missing months (e.g. SKU not in this year's
+    # budget) just get budget: None, which the chart skips.
+    # ============================================================
+    budget_series = get_budget_series_for_sku(item_key)
+    for point in trend_map.values():
+        point["budget"] = budget_series.get(point["period"])
+
     sales_trend = sorted(
         trend_map.values(),
         key=lambda x: x["period"]
@@ -713,6 +755,36 @@ def _build_dashboard_response(item_code: str):
 
 
 # ============================================================
+# LIGHTWEIGHT DASHBOARD — leftover (non-focus) SKUs
+#
+# This function is I/O only: load the raw history, the master-mapped
+# forecast row, and the display info, then hand everything to
+# engines/leftover_sku_engine.build_lightweight_dashboard for the actual
+# computation. No business logic lives here.
+# ============================================================
+def _build_lightweight_dashboard_response(item_code: str) -> Optional[dict]:
+    item_key = str(item_code).strip().replace(".0", "")
+
+    sku_hist = _get_leftover_sku_history(item_key)
+
+    master_row = None
+    try:
+        master_df = load_master_forecast_mapped()
+        if not master_df.empty and "ProductCode" in master_df.columns:
+            master_df = master_df.copy()
+            master_df["ProductCode"] = master_df["ProductCode"].astype(str)
+            match = master_df[master_df["ProductCode"] == item_key]
+            if not match.empty:
+                master_row = match.iloc[0].to_dict()
+    except Exception:
+        master_row = None
+
+    sku_info = get_sku_display_info(item_key)
+    budget_series = get_budget_series_for_sku(item_key)
+
+    return build_lightweight_dashboard(item_key, sku_hist, master_row, sku_info, budget_series)
+
+# ============================================================
 # RAW PROCESSING
 # ============================================================
 def process_actual_raw_now():
@@ -773,13 +845,44 @@ def process_live_raw_now():
 # PUBLIC API
 # ============================================================
 def get_dashboard(item_code: str):
-    return _build_dashboard_response(item_code)
+    """
+    Full dashboard for focus SKUs (preprocessed data + engineered features).
+    Falls back to the lightweight raw-history path for leftover (non-focus)
+    budgeted SKUs, which never go through preprocess_engine.
+    """
+    result = _build_dashboard_response(item_code)
+    if result is not None:
+        return result
+    return _build_lightweight_dashboard_response(item_code)
 
 
 def get_skus():
+    """Focus SKUs only — same behavior as before, unchanged for existing callers."""
     if data.empty or "ItemCode" not in data.columns:
         return []
     return sorted(data["ItemCode"].astype(str).unique().tolist())
+
+
+def get_skus_full() -> list:
+    """
+    Full SKU list including leftover (non-focus) budgeted SKUs, each tagged
+    is_focus so the UI can flag which ones only get the lightweight dashboard.
+    Focus SKUs come from in-memory `data`; the rest come from the master
+    SKU list (sku_master_full.csv).
+    """
+    focus_codes = set(get_skus())
+    out = [{"item_code": c, "is_focus": True} for c in sorted(focus_codes)]
+
+    try:
+        master_df = load_sku_master_full()
+        if not master_df.empty and "ProductCode" in master_df.columns:
+            for code in sorted(master_df["ProductCode"].astype(str).unique().tolist()):
+                if code not in focus_codes:
+                    out.append({"item_code": code, "is_focus": False})
+    except Exception:
+        pass
+
+    return out
 
 
 def reload_data_now():
@@ -890,11 +993,28 @@ def export_trend_forecast_now(forecast_df: Optional[pd.DataFrame] = None,
                 vals = forecast_df["Forecast_Month"].dropna().astype(str)
                 forecast_month_label = vals.iloc[0] if len(vals) else None
 
-        budget_skus = load_budget_item_codes()
+        # FIXED: the SKU universe for trend forecasting must come from
+        # sku_master_full.csv (same source used to build the master-mapped
+        # file), NOT from load_budget_item_codes()'s own composite-key
+        # generator. Those two produced DIFFERENT synthetic IDs for the
+        # same placeholder products (e.g. "New::Bayer::Jadelle" vs
+        # "SYN-BAYER-JADELLE"), so trend rows for those SKUs could never
+        # match back onto the master list. Using one shared ID source
+        # guarantees every trend-forecasted SKU lands correctly in
+        # forecast_master_mapped.csv.
+        try:
+            master_df = load_sku_master_full()
+            budget_skus = (
+                sorted(master_df["ProductCode"].astype(str).unique().tolist())
+                if not master_df.empty else []
+            )
+        except Exception:
+            budget_skus = []
+
         if not budget_skus:
             return {
                 "ok": False,
-                "error": "No budget SKUs found (Budget.xlsx missing or unreadable).",
+                "error": "No budget SKUs found (sku_master_full.csv missing or empty).",
             }, 400
 
         fact_history_df = load_fact_history_all_skus()
@@ -931,7 +1051,26 @@ def export_trend_forecast_now(forecast_df: Optional[pd.DataFrame] = None,
 
 
 def export_forecast_latest_now():
+    """
+    Full export pipeline:
+        1. Run the AI model for every SKU  -> forecast_latest.csv
+        2. Run the trend baseline for budgeted SKUs outside the model list
+           -> forecast_trend_latest.csv
+        3. Merge (1) + (2) into one deduped M+1 table
+           -> forecast_all_skus_latest.csv
+        4. Map that onto the full master SKU list (sku_master_full.csv),
+           attaching the M+2..M+6 horizon forecast where available
+           -> forecast_master_mapped.csv
+
+    Steps 3-4 are non-fatal: if the master list or horizon file isn't ready
+    yet, the model/trend exports (which everything else depends on) still
+    complete and are logged.
+    """
     df_forecast, label = export_forecast_all_skus()
+    df_forecast = df_forecast.copy()
+    if not df_forecast.empty:
+        df_forecast["Forecast_Source"] = "AI_MODEL"
+
     out_path = save_forecast_latest(df_forecast)
 
     history_base_month = None
@@ -961,13 +1100,47 @@ def export_forecast_latest_now():
     if not trend_result.get("ok"):
         print(f"[TREND] Warning: {trend_result.get('error')}")
 
+    # Merge model + trend into the ONE file downstream code should read
+    # (Insights, budget analysis, reporting — no more joining two files).
+    combined_path = None
+    combined_rows = 0
+    try:
+        trend_df = load_trend_forecast_latest()
+        combined_df = build_combined_forecast_table(df_forecast, trend_df)
+        combined_path = save_forecast_all_skus_latest(combined_df)
+        combined_rows = int(len(combined_df))
+    except Exception as e:
+        print(f"[COMBINED FORECAST] Warning: {e}")
+        combined_df = pd.DataFrame()
+
+    # Map the combined forecast + horizon onto the full master SKU list
+    # (real codes + synthetic codes for products with no ItemCode).
+    master_mapped_path = None
+    master_mapped_rows = 0
+    try:
+        master_df = load_sku_master_full()
+        try:
+            horizon_df = load_forecast_horizon_latest()
+        except FileNotFoundError:
+            horizon_df = pd.DataFrame()
+
+        master_mapped_df = build_master_forecast_table(master_df, combined_df, horizon_df)
+        master_mapped_path = save_master_forecast_mapped(master_mapped_df)
+        master_mapped_rows = int(len(master_mapped_df))
+    except Exception as e:
+        print(f"[MASTER FORECAST MAP] Warning: {e}")
+
     return {
         "ok":      True,
-        "message": "Forecast exported for all SKUs",
+        "message": "Forecast exported — model + trend merged and mapped onto master SKU list",
         "next_month": label,
         "rows":    int(len(df_forecast)),
         "path":    out_path,
         "trend":   trend_result,
+        "combined_path": combined_path,
+        "combined_rows": combined_rows,
+        "master_mapped_path": master_mapped_path,
+        "master_mapped_rows": master_mapped_rows,
     }, 200
 
 
