@@ -16,13 +16,23 @@ from services.forecast_service import (
     load_trend_forecast_history,
 )
 
+# Single source of truth for ItemCode -> Agency/ItemName resolution, and for
+# the canonical synthetic ("SYN-...") codes assigned to budgeted products
+# that have no real ItemCode. Built off Budget.xlsx + Agency map.xlsx.
+# Using this everywhere (instead of reading Agency map.xlsx directly, and
+# instead of inventing a second synthetic-code scheme locally) keeps every
+# table in Insights — actuals, forecast, budget — resolving the SAME
+# ItemCode for the SAME product as the rest of the pipeline (e.g.
+# engines/master_forecast_engine.py). It is also the definition of "the
+# master SKU universe" used to scope every KPI total in this file.
+from services.sku_master_service import load_sku_master_full
+
 BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROJECT_DIR = os.path.dirname(BACKEND_DIR)
 
 FORECAST_FILE         = os.path.join(BACKEND_DIR, "data", "outputs", "forecast_latest.csv")
 FORECAST_HISTORY_FILE = os.path.join(BACKEND_DIR, "data", "logs", "forecast_horizon_history.csv")
 PROCESSED_DATA_FILE   = os.path.join(BACKEND_DIR, "data", "processed", "processed_data_actual.csv")
-AGENCY_MAPPING_FILE   = os.path.join(PROJECT_DIR,  "data", "Master Data", "Agency map.xlsx")
 CHAMPION_LONG_FILE    = os.path.join(BACKEND_DIR, "models", "registry", "champion_long_map_df.pkl")
 CHAMPION_MEDIUM_FILE  = os.path.join(BACKEND_DIR, "models", "registry", "champion_medium_map_df.pkl")
 BUDGET_FILE           = os.path.join(PROJECT_DIR, "data", "Master Data", "Budget.xlsx")
@@ -32,13 +42,39 @@ BUDGET_FILE           = os.path.join(PROJECT_DIR, "data", "Master Data", "Budget
 BUDGET_SHEET_NAME = "All Budget 26 27 FY"
 
 # ─────────────────────────────────────────────────────────────
-# Forecast comparison (Forecast tab) — third-party forecasts vs our model
+# Distributor (RD) unit price — Inventory.xlsx "DB" sheet
 # ─────────────────────────────────────────────────────────────
-# External forecasts supplied by other parties/systems. Compared against our
-# own model's forecast for the SAME month, restricted to the budgeted SKU
-# list (763 items). Sheet has one row per PlantId/DataMeasure/ForecastDate/
-# ProductId combo; DataMeasure identifies which forecasting method produced
-# the row.
+# PRICING RULE (do not mix these two):
+#   Budget qty/value  -> PRIMARY movement -> valued at Budget_Price
+#                        (Budget.xlsx, a planning price)
+#   Actual sales qty  -> SECONDARY movement (distributor sell-through)
+#   Forecast qty      -> also a SECONDARY-movement prediction
+#                        -> BOTH valued at Distributor_Unit_Price
+#                        (Inventory.xlsx DB sheet, the real RD price)
+# Using Budget_Price for actual/forecast values (or vice versa) produces a
+# value ratio that doesn't track the qty ratio — see the FYTD sanity check:
+# with only 2 of 12 fiscal months elapsed, qty reach was a normal ~13%, but
+# value reach came out near 49% under budget-price valuation because a few
+# high-volume SKUs had a stale/mismatched Budget_Price. Distributor price
+# fixes that because it's the price those units actually move at.
+INVENTORY_FILE = (
+    "/Users/dhanujiamanda/Documents/Projects/Agentic AI /Pipeline/"
+    "Agentic-AI-for-Pharma-Stockout-Problem/data/Inventory.xlsx"
+)
+INVENTORY_DB_SHEET = "DB"
+
+# ─────────────────────────────────────────────────────────────
+# Forecast comparison (Forecast tab) — third-party forecasts vs our model vs actual
+# ─────────────────────────────────────────────────────────────
+# External forecasts supplied by another system, keyed by ProductId/ForecastDate.
+# Compared against OUR model's historically-issued forecast AND actual sales,
+# all for the SAME month — specifically the CURRENTLY DISPLAYED month on the
+# Insights page (the latest CLOSED month, e.g. May), not the next/future
+# forecast month (e.g. June). Actuals don't exist yet for a future month, so
+# a three-way comparison ("mine vs theirs vs what happened") only makes
+# sense once the month has closed. Sheet has one row per
+# PlantId/DataMeasure/ForecastDate/ProductId combo; DataMeasure identifies
+# which forecasting method produced the row.
 FORECAST_COMPARISON_FILE = (
     "/Users/dhanujiamanda/Documents/Projects/Agentic AI /Pipeline/"
     "Agentic-AI-for-Pharma-Stockout-Problem/data/Forecast.xlsx"
@@ -52,6 +88,7 @@ FORECAST_MEASURE_COLUMN_MAP = {
     "Best Fit With MI":            "Best_Fit_With_MI_Forecast_Qty",
     "Consensus Forecast":          "Consensus_Forecast_Qty",
     "Final Forecast":              "Final_Forecast_Qty",
+    "3MA Deviation":               "Three_MA_Deviation_Forecast_Qty",
 }
 
 _MONTH_MAP = { "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,"jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,}
@@ -104,6 +141,29 @@ def _parse_forecast_month_dt(df):
             f"No recognisable forecast month column. Columns: {list(df.columns)}"
         )
     return df
+
+
+def _coerce_price_column(series: pd.Series) -> pd.Series:
+    """
+    UnitPrice in Inventory.xlsx can come through as a Timestamp instead of
+    a number — the source cell was date-formatted in Excel at some point,
+    so pandas/openpyxl parses the numeric price as a date (e.g. a price of
+    ~2142 reads back as "1905-11-10"). Reverse that: for any value that
+    parsed as a datetime, convert it back to its Excel serial-day number,
+    which recovers the original numeric price. Genuinely numeric cells
+    pass through pd.to_numeric unchanged.
+    """
+    EPOCH = pd.Timestamp("1899-12-30")
+
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return (series - EPOCH).dt.days.astype(float)
+
+    def _one(v):
+        if isinstance(v, pd.Timestamp):
+            return float((v - EPOCH).days)
+        return pd.to_numeric(v, errors="coerce")
+
+    return series.apply(_one)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,19 +360,113 @@ def load_forecast_latest():
 
 
 def load_agency_mapping():
-    if not os.path.exists(AGENCY_MAPPING_FILE):
+    """
+    Canonical ItemCode -> Agency/ItemName resolver, sourced from
+    sku_master_full.csv (services/sku_master_service.py — built off
+    Budget.xlsx + Agency map.xlsx).
+
+    This is the single source of truth for display fields across every
+    Insights table (actuals, forecast, budget). It covers BOTH real-coded
+    products AND synthetic-coded ("SYN-...") budgeted products that have no
+    ItemCode in SAP/Budget yet — so a budget row and a forecast row for the
+    same product always resolve to the same ItemCode/Agency/ItemName.
+    """
+    master = load_sku_master_full()  # ProductCode, ProductName, Agency, AgencyCode, Is_Synthetic_Code
+    if master is None or master.empty:
         return pd.DataFrame(columns=["ItemCode", "ItemName", "Agency"])
 
-    df = pd.read_excel(AGENCY_MAPPING_FILE)
-    df = df.rename(columns={"Code": "ItemCode", "Name": "ItemName", "AgencyName": "Agency"})
+    out = master.rename(columns={
+        "ProductCode": "ItemCode",
+        "ProductName": "ItemName",
+    })[["ItemCode", "ItemName", "Agency"]].copy()
 
-    required = ["ItemCode", "ItemName", "Agency"]
-    missing  = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Agency mapping missing columns after rename: {missing}. Found: {list(df.columns)}")
+    out["ItemCode"] = out["ItemCode"].astype(str)
+    return out.drop_duplicates("ItemCode")
 
-    df = _force_itemcode_str(df)
-    return df[["ItemCode", "ItemName", "Agency"]].drop_duplicates("ItemCode")
+
+def load_master_sku_codes() -> set:
+    """
+    The full budgeted-SKU universe (real + synthetic codes), used to scope
+    every KPI total in this file. Sales/forecast/loss rows for an ItemCode
+    outside this set (e.g. a focus SKU the model forecasts but which has no
+    budget entry at all) still appear in the per-SKU tables — just excluded
+    from summed totals, so numbers stay internally consistent instead of
+    mixing two different SKU universes silently.
+    """
+    master = load_sku_master_full()
+    if master is None or master.empty or "ProductCode" not in master.columns:
+        return set()
+    return set(master["ProductCode"].astype(str))
+
+
+def load_distributor_price_lookup():
+    """
+    Reads Inventory.xlsx -> "DB" sheet: the RD (distributor-to-customer)
+    unit price. Secondary_Sales_Qty and Forecast_Qty are both distributor
+    sell-through (secondary movement), so THIS is the correct price to
+    value them at. Budget_Price (from Budget.xlsx) values PRIMARY movement
+    (budget qty) and must never be applied to sales/forecast qty, or vice
+    versa — mixing the two produces a value ratio that doesn't track the
+    qty ratio (see the FYTD sanity check in build_agency_performance_table).
+
+    Per SKU: takes the price from its most recent available month
+    (averaged across distributors/batches in that month, since price can
+    vary slightly by batch/distributor).
+
+    Returns: ItemCode | Distributor_Unit_Price
+    """
+    empty = pd.DataFrame(columns=["ItemCode", "Distributor_Unit_Price"])
+    if not os.path.exists(INVENTORY_FILE):
+        print(f"[INSIGHTS] Inventory file not found: {INVENTORY_FILE}")
+        return empty
+
+    try:
+        df = pd.read_excel(INVENTORY_FILE, sheet_name=INVENTORY_DB_SHEET)
+        df.columns = df.columns.astype(str).str.strip()
+
+        required = ["Month", "ItemCode", "UnitPrice"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"[INSIGHTS] Inventory DB sheet missing columns: {missing}. "
+                  f"Found: {list(df.columns)}")
+            return empty
+
+        df["ItemCode"] = (
+            pd.to_numeric(df["ItemCode"], errors="coerce")
+            .astype("Int64").astype(str).replace("<NA>", np.nan)
+        )
+        df = df.dropna(subset=["ItemCode"])
+
+        df["Month_dt"] = pd.to_datetime(df["Month"], errors="coerce")
+        df = df.dropna(subset=["Month_dt"])
+
+        df["UnitPrice"] = _coerce_price_column(df["UnitPrice"])
+        df = df.dropna(subset=["UnitPrice"])
+        df = df[df["UnitPrice"] > 0]
+
+        if df.empty:
+            print("[INSIGHTS] Inventory DB sheet: no usable UnitPrice rows after cleaning.")
+            return empty
+
+        latest_month = df["Month_dt"].max()
+        df = df.sort_values(["ItemCode", "Month_dt"])
+        latest_per_sku = df.groupby("ItemCode").tail(1)[["ItemCode", "UnitPrice"]]
+
+        out = (
+            latest_per_sku.groupby("ItemCode", as_index=False)["UnitPrice"]
+            .mean()
+            .rename(columns={"UnitPrice": "Distributor_Unit_Price"})
+        )
+        out["Distributor_Unit_Price"] = out["Distributor_Unit_Price"].round(2)
+
+        print(f"[INSIGHTS] Distributor price loaded for {len(out)} SKUs "
+              f"(latest inventory data through {latest_month:%b %Y}).")
+        return out
+
+    except Exception as e:
+        print(f"[INSIGHTS] Warning loading distributor price: {e}")
+        import traceback; traceback.print_exc()
+        return empty
 
 
 def load_shp_lookup():
@@ -644,6 +798,15 @@ def load_budget_lookup(current_month_dt):
 
     per_sku_df columns:
         ItemCode, Agency_Budget, Budget_Qty (current month), Annual_Budget_Qty
+
+    ItemCode resolution:
+        Every row is matched to services/sku_master_service.py's
+        sku_master_full.csv by (Agency, ItemName) — the SAME canonical
+        source used everywhere else in Insights. Real ItemCodes and
+        synthetic "SYN-..." codes both come from there, so budget rows join
+        cleanly against anything else keyed by that master (agency map,
+        forecast pipeline joins, etc.) instead of using a locally-invented key.
+
     budget_meta keys:
         fiscal_start (Timestamp | None), fiscal_end (Timestamp | None),
         month_labels (list[str]), current_month_found (bool)
@@ -705,49 +868,79 @@ def load_budget_lookup(current_month_dt):
             print(f"[INSIGHTS] Budget: no monthly columns found. Columns: {cols}")
             return empty_sku, empty_meta
 
-        # ItemCode normalisation — keep placeholder rows.
-        # Real codes are numeric → canonical int-string ("123.0" → "123").
-        # The sheet also contains budget rows for NEW / not-yet-coded products
-        # ("New", "Getz Pharma1", ...). Business wants the FULL budget list,
-        # so these are KEPT and flagged Is_Unmapped.
-        #
-        # Several DIFFERENT products can share the same placeholder label
-        # (five distinct products all coded "New"), so unmapped rows get a
-        # composite key  <label>::<agency>::<product>  to stay unique and
-        # survive the per-SKU groupby. UI: display ItemCode.split("::")[0]
-        # (the raw label) when Is_Unmapped is true.
-        raw_code = df[itemcode_col].astype(str).str.strip()
-        num_code = pd.to_numeric(df[itemcode_col], errors="coerce")
-        df["_unmapped"] = num_code.isna()
+        # ── ItemCode resolution via sku_master_full.csv (canonical) ──────────
+        # Real numeric codes are kept as-is (canonicalised to int-string).
+        # Rows with no numeric code (new/not-yet-coded products) are matched
+        # to the master's synthetic "SYN-{AgencyCode}-{slug}" code by
+        # (Agency, ItemName) — the same key sku_master_service used to
+        # generate them, so this table's ItemCodes are identical to the ones
+        # used everywhere else in the pipeline.
+        master_df = load_sku_master_full()  # ProductCode, ProductName, Agency, AgencyCode, Is_Synthetic_Code
+        master_df = master_df.copy()
+        master_df["_key"] = (
+            master_df["Agency"].astype(str).str.strip().str.upper()
+            + "::" + master_df["ProductName"].astype(str).str.strip().str.upper()
+        )
+        code_lookup = (
+            master_df.drop_duplicates("_key")
+            .set_index("_key")[["ProductCode", "Is_Synthetic_Code"]]
+            .to_dict("index")
+        )
 
         name_series = (
             df[itemname_col].astype(str).str.strip().replace({"nan": "", "None": ""})
             if itemname_col else pd.Series("", index=df.index)
         )
-        synthetic_key = (
-            raw_code
-            + "::" + df[agency_col].astype(str).str.strip()
-            + "::" + name_series
+        match_key = (
+            df[agency_col].astype(str).str.strip().str.upper()
+            + "::" + name_series.str.upper()
         )
 
-        df[itemcode_col] = np.where(
-            num_code.notna(),
-            num_code.astype("Int64").astype(str),
-            synthetic_key,
+        df["ItemCode"]  = match_key.map(lambda k: code_lookup.get(k, {}).get("ProductCode"))
+        df["_unmapped"] = match_key.map(lambda k: code_lookup.get(k, {}).get("Is_Synthetic_Code"))
+        df["_unmapped"] = pd.to_numeric(df["_unmapped"], errors="coerce").fillna(0).astype(bool)
+
+        # Fallback for the rare row the master didn't match (shouldn't
+        # normally happen — both are built from the same sheet) — use the
+        # sheet's own numeric code directly rather than dropping the row.
+        raw_code = df[itemcode_col].astype(str).str.strip()
+        num_code = pd.to_numeric(df[itemcode_col], errors="coerce")
+        fallback_code = pd.Series(
+            np.where(num_code.notna(), num_code.astype("Int64").astype(str), np.nan),
+            index=df.index,
         )
-        # Drop only truly blank rows (subtotals etc.)
-        blank = df["_unmapped"] & raw_code.isin(["", "nan", "None", "NaN", "<NA>"])
-        df = df[~blank].copy()
+        df["ItemCode"] = df["ItemCode"].fillna(fallback_code)
+
+        unmatched = df["ItemCode"].isna()
+        blank_name = raw_code.isin(["", "nan", "None", "NaN", "<NA>"]) & name_series.isin(["", "nan", "None"])
+        drop_mask = unmatched & blank_name  # true blank/subtotal rows
+        if drop_mask.any():
+            print(f"[INSIGHTS] Budget: dropping {int(drop_mask.sum())} blank/subtotal rows.")
+        df = df[~drop_mask].copy()
+
+        still_unmatched = df["ItemCode"].isna()
+        if still_unmatched.any():
+            print(f"[INSIGHTS] Budget: {int(still_unmatched.sum())} rows had no SKU-master match "
+                  f"and no numeric ItemCode — dropping. Run sku_master_service.build_sku_master() "
+                  f"to refresh the master if this is unexpected.")
+        df = df[~still_unmatched].copy()
+
+        itemcode_col = "ItemCode"  # everything downstream keys off this now
+
         n_unmapped = int(df["_unmapped"].sum())
         if n_unmapped:
             print(f"[INSIGHTS] Budget: {n_unmapped} unmapped/new-product rows kept "
-                  f"(keyed by label::agency::product, zero sales, Forecast_Source=NONE).")
+                  f"(synthetic ItemCode from sku_master_full.csv, Forecast_Source=NONE).")
 
         # Null-safe monthly values
         for col in month_col_map:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).clip(lower=0)
 
-        # ── Budgeted unit price (BudgetPrice column) ─────────────────────────
+        # ── Budgeted unit price (BudgetPrice column) — PRIMARY movement price.
+        # Used ONLY to value Budget_Qty / Annual_Budget_Qty. Never applied to
+        # actual sales or forecast qty (those are secondary movement and use
+        # Distributor_Unit_Price from Inventory.xlsx instead — see
+        # load_distributor_price_lookup and build_budget_analysis_table).
         price_col = next(
             (c for c in ["BudgetPrice", "Budget_Price", "UnitPrice", "Unit_Price", "Price"]
              if c in df.columns),
@@ -815,22 +1008,19 @@ def load_budget_lookup(current_month_dt):
 def load_external_forecast_comparison(target_month_dt):
     """
     Reads Forecast.xlsx (Sheet1) — third-party forecasts per ProductId,
-    filtered to `target_month_dt` (the month currently shown on the Insights
-    UI, i.e. the model's next forecast month). Pivots the four known
-    DataMeasure labels into separate, clearly-named columns:
+    filtered to `target_month_dt`. Called with the CURRENTLY DISPLAYED
+    Insights month (the latest closed month) so the result can be compared
+    against both our own model's forecast for that month AND actual sales.
 
-        "Approved Consensus Forecast" → Approved_Consensus_Forecast_Qty
-        "Best Fit With MI"            → Best_Fit_With_MI_Forecast_Qty
-        "Consensus Forecast"          → Consensus_Forecast_Qty
-        "Final Forecast"              → Final_Forecast_Qty
-
-    Any DataMeasure value outside this list is ignored. Where a SKU has more
-    than one row for the same DataMeasure/month (re-runs), the most recently
-    updated row wins (LastUpdate, then CreationDate).
+    Pivots the known DataMeasure labels into separate, clearly-named columns
+    (see FORECAST_MEASURE_COLUMN_MAP). Any DataMeasure value outside that
+    map is ignored. Where a SKU has more than one row for the same
+    DataMeasure/month (re-runs), the most recently updated row wins
+    (LastUpdate, then CreationDate).
 
     Returns: ItemCode | Approved_Consensus_Forecast_Qty
              | Best_Fit_With_MI_Forecast_Qty | Consensus_Forecast_Qty
-             | Final_Forecast_Qty
+             | Final_Forecast_Qty | Three_MA_Deviation_Forecast_Qty
     """
     out_cols = ["ItemCode"] + list(FORECAST_MEASURE_COLUMN_MAP.values())
     empty = pd.DataFrame(columns=out_cols)
@@ -912,7 +1102,7 @@ def load_external_forecast_comparison(target_month_dt):
 # ─────────────────────────────────────────────────────────────────────────────
 def build_budget_analysis_table(budget_sku_lookup, budget_meta,
                                 actuals_df, agency_map, loss_lookup,
-                                latest_month_dt,
+                                latest_month_dt, price_lookup,
                                 all_sales_df=None, trend_lookup=None):
     """
     One row per budgeted SKU (from "All Budget 26 27 FY"), even when the SKU
@@ -925,6 +1115,14 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
         model forecast when available          → Forecast_Source = "MODEL"
         else trend baseline (trend engine)     → Forecast_Source = "TREND"
         else null (budgeted, no history)       → Forecast_Source = "NONE"
+
+    PRICING (do not mix these two — see module-level note):
+        Budget_Qty / Annual_Budget_Qty are PRIMARY movement -> valued at
+            Budget_Price (Budget.xlsx planning price).
+        Current_Month_Sales / FYTD_Sales_Qty are SECONDARY movement
+            (distributor sell-through) -> valued at Distributor_Unit_Price
+            (Inventory.xlsx DB sheet), falling back to Budget_Price only
+            when a SKU has no inventory-price history yet.
 
     Columns:
         Agency, ItemCode, ItemName,
@@ -939,6 +1137,9 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
         FYTD_Sales_Qty          (fiscal-year-to-date actual sales)
         Annual_Reach_%          (FYTD / Annual, null when Annual = 0)
         Annual_Remaining_Qty    (max(Annual − FYTD, 0))
+        Budget_Price            (primary/planning price — values Budget_*)
+        Distributor_Unit_Price  (secondary/RD price — values sales/forecast)
+        Price_Source            ("DISTRIBUTOR" | "BUDGET_FALLBACK" | "NONE")
     """
     empty = pd.DataFrame(columns=[
         "Agency", "ItemCode", "ItemName",
@@ -947,8 +1148,10 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
         "Possible_Achievement_%",
         "Annual_Budget_Qty", "FYTD_Sales_Qty",
         "Annual_Reach_%", "Annual_Remaining_Qty",
-        "Budget_Price", "Budget_Value", "Current_Month_Sales_Value",
-        "Annual_Budget_Value", "FYTD_Sales_Value",
+        "Budget_Price", "Budget_Value", "Annual_Budget_Value",
+        "Distributor_Unit_Price", "Price_Source",
+        "Current_Month_Sales_Value", "Current_Month_Forecast_Value",
+        "FYTD_Sales_Value",
         "Is_Unmapped",
     ])
 
@@ -1035,14 +1238,28 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
     bt["Budget_Qty"]        = pd.to_numeric(bt["Budget_Qty"],        errors="coerce").fillna(0)
     bt["Annual_Budget_Qty"] = pd.to_numeric(bt["Annual_Budget_Qty"], errors="coerce").fillna(0)
 
-    # ── Value metrics (budgeted unit price × qty) ────────────────────────────
-    # Sales values are valued AT BUDGET PRICE (no transaction price available)
-    # so budget-vs-actual value comparisons stay like-for-like.
+    # ── Pricing: Budget_Price (primary) vs Distributor_Unit_Price (secondary) ─
     bt["Budget_Price"] = pd.to_numeric(bt.get("Budget_Price"), errors="coerce").fillna(0)
+
+    if price_lookup is not None and not price_lookup.empty:
+        bt = bt.merge(price_lookup, on="ItemCode", how="left")
+    else:
+        bt["Distributor_Unit_Price"] = np.nan
+
+    bt["Price_Source"] = np.where(
+        bt["Distributor_Unit_Price"].notna(), "DISTRIBUTOR",
+        np.where(bt["Budget_Price"] > 0, "BUDGET_FALLBACK", "NONE"),
+    )
+    # Sales/forecast (secondary movement) use distributor price; fall back to
+    # Budget_Price only when a SKU has no inventory-price history at all.
+    bt["_sales_price"] = bt["Distributor_Unit_Price"].fillna(bt["Budget_Price"]).fillna(0)
+
+    # Budget (primary movement) ALWAYS uses Budget_Price, never distributor price.
     bt["Budget_Value"]              = bt["Budget_Qty"]          * bt["Budget_Price"]
     bt["Annual_Budget_Value"]       = bt["Annual_Budget_Qty"]   * bt["Budget_Price"]
-    bt["Current_Month_Sales_Value"] = bt["Current_Month_Sales"] * bt["Budget_Price"]
-    bt["FYTD_Sales_Value"]          = bt["FYTD_Sales_Qty"]      * bt["Budget_Price"]
+    bt["Current_Month_Sales_Value"] = bt["Current_Month_Sales"] * bt["_sales_price"]
+    bt["Current_Month_Forecast_Value"] = bt["Current_Month_Forecast"].fillna(0) * bt["_sales_price"]
+    bt["FYTD_Sales_Value"]          = bt["FYTD_Sales_Qty"]      * bt["_sales_price"]
 
     # ── Ratios (null-safe: never divide by 0) ────────────────────────────────
     bt["Achievement_%"] = np.where(
@@ -1064,12 +1281,16 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
         bt["Annual_Budget_Qty"] - bt["FYTD_Sales_Qty"], 0
     )
 
+    bt = bt.drop(columns=["_sales_price"], errors="ignore")
+
     for c in ["Budget_Qty", "Current_Month_Sales", "Current_Month_Forecast",
               "Achievement_%", "Possible_Achievement_%",
               "Annual_Budget_Qty", "FYTD_Sales_Qty",
               "Annual_Reach_%", "Annual_Remaining_Qty",
-              "Budget_Price", "Budget_Value", "Current_Month_Sales_Value",
-              "Annual_Budget_Value", "FYTD_Sales_Value"]:
+              "Budget_Price", "Budget_Value", "Annual_Budget_Value",
+              "Distributor_Unit_Price",
+              "Current_Month_Sales_Value", "Current_Month_Forecast_Value",
+              "FYTD_Sales_Value"]:
         bt[c] = pd.to_numeric(bt[c], errors="coerce").round(2)
 
     bt = bt[list(empty.columns)].copy()
@@ -1078,36 +1299,44 @@ def build_budget_analysis_table(budget_sku_lookup, budget_meta,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Forecast comparison table builder — model vs third parties, budgeted SKUs
+# Forecast comparison table builder — model vs third parties vs actual,
+# for the CURRENTLY DISPLAYED (latest closed) month
 # ─────────────────────────────────────────────────────────────────────────────
 def build_forecast_comparison_table(budget_sku_lookup, agency_map,
-                                    own_forecast_lookup, external_forecast_df,
-                                    target_month_label):
+                                    own_forecast_lookup, actual_sales_lookup,
+                                    external_forecast_df,
+                                    comparison_month_label):
     """
-    One row per budgeted SKU (inner set = the 763-item budget list), comparing
-    our own model's forecast against the third-party forecasts sourced from
-    Forecast.xlsx, both for the SAME month — the month currently shown on the
-    Insights UI (the model's next forecast month).
+    One row per budgeted SKU comparing, for the SAME month:
+        - My_Model_Forecast_Qty     (our model's forecast, as it was issued
+                                      for this month — from forecast history)
+        - {source}_Forecast_Qty     (third-party forecasts from Forecast.xlsx)
+        - Actual_Sales_Qty          (what actually happened)
 
-    own_forecast_lookup: ItemCode | My_Model_Forecast_Qty
+    The month used is the CURRENTLY DISPLAYED Insights month (the latest
+    CLOSED month, e.g. May) — not the next/future forecast month (e.g.
+    June) — because Actual_Sales_Qty only exists once a month has closed.
+    This is what makes "mine vs theirs vs reality" possible.
 
-    Columns:
-        Agency, ItemCode, ItemName, Forecast_Month,
-        My_Model_Forecast_Qty,
-        Approved_Consensus_Forecast_Qty, Best_Fit_With_MI_Forecast_Qty,
-        Consensus_Forecast_Qty, Final_Forecast_Qty
+    Also computes a per-source Accuracy_% vs actual (null when that source
+    has no forecast value, or when the forecast is 0/not applicable).
+
+    own_forecast_lookup:    ItemCode | My_Model_Forecast_Qty
+    actual_sales_lookup:    ItemCode | Actual_Sales_Qty
+    external_forecast_df:   output of load_external_forecast_comparison()
     """
-    value_cols = [
-        "My_Model_Forecast_Qty",
-        "Approved_Consensus_Forecast_Qty", "Best_Fit_With_MI_Forecast_Qty",
-        "Consensus_Forecast_Qty", "Final_Forecast_Qty",
-    ]
-    empty = pd.DataFrame(columns=["Agency", "ItemCode", "ItemName", "Forecast_Month"] + value_cols)
+    forecast_cols = ["My_Model_Forecast_Qty"] + list(FORECAST_MEASURE_COLUMN_MAP.values())
+    accuracy_cols = [c.replace("_Forecast_Qty", "_Accuracy_%") for c in forecast_cols]
+
+    empty = pd.DataFrame(columns=(
+        ["Agency", "ItemCode", "ItemName", "Comparison_Month"]
+        + forecast_cols + ["Actual_Sales_Qty"] + accuracy_cols
+    ))
 
     if budget_sku_lookup is None or budget_sku_lookup.empty:
         return empty
 
-    # Budgeted SKU list only (left join) — this IS the 763-item universe.
+    # Budgeted SKU list only (left join) — this IS the budgeted-item universe.
     ft = budget_sku_lookup[["ItemCode"]].drop_duplicates().copy()
 
     ft = ft.merge(agency_map, on="ItemCode", how="left")
@@ -1118,14 +1347,32 @@ def build_forecast_comparison_table(budget_sku_lookup, agency_map,
         ft = ft.merge(own_forecast_lookup, on="ItemCode", how="left")
     if external_forecast_df is not None and not external_forecast_df.empty:
         ft = ft.merge(external_forecast_df, on="ItemCode", how="left")
+    if actual_sales_lookup is not None and not actual_sales_lookup.empty:
+        ft = ft.merge(actual_sales_lookup, on="ItemCode", how="left")
 
-    for col in value_cols:
+    for col in forecast_cols:
         if col not in ft.columns:
             ft[col] = np.nan
         ft[col] = pd.to_numeric(ft[col], errors="coerce").round(2)
 
-    ft["Forecast_Month"] = target_month_label
-    ft = ft[["Agency", "ItemCode", "ItemName", "Forecast_Month"] + value_cols].copy()
+    if "Actual_Sales_Qty" not in ft.columns:
+        ft["Actual_Sales_Qty"] = np.nan
+    ft["Actual_Sales_Qty"] = pd.to_numeric(ft["Actual_Sales_Qty"], errors="coerce").fillna(0).round(2)
+
+    # Per-source accuracy vs actual — null when that source had no forecast.
+    for fcol, acol in zip(forecast_cols, accuracy_cols):
+        ft[acol] = np.where(
+            ft[fcol].notna() & (ft[fcol] > 0),
+            (1 - (ft[fcol] - ft["Actual_Sales_Qty"]).abs() / ft[fcol]).clip(0, 1) * 100,
+            np.nan,
+        )
+        ft[acol] = pd.to_numeric(ft[acol], errors="coerce").round(2)
+
+    ft["Comparison_Month"] = comparison_month_label
+    ft = ft[
+        ["Agency", "ItemCode", "ItemName", "Comparison_Month"]
+        + forecast_cols + ["Actual_Sales_Qty"] + accuracy_cols
+    ].copy()
     ft = ft.sort_values(["Agency", "ItemCode"]).reset_index(drop=True)
     return ft
 
@@ -1141,6 +1388,8 @@ def build_agency_performance_table():
     wmape_lookup = load_champion_wmape_lookup()
     shp_lookup   = load_shp_lookup()
     loss_lookup  = load_current_month_forecast_loss()
+    price_lookup = load_distributor_price_lookup()
+    master_codes = load_master_sku_codes()
 
     latest_month_dt      = actuals_df["Month_dt"].max()
     data_upto_label      = latest_month_dt.strftime("%b %Y")
@@ -1171,15 +1420,34 @@ def build_agency_performance_table():
         else pd.DataFrame(columns=actuals_df.columns)
     )
 
-    cur_sales = (
-        current_month_actuals.groupby("ItemCode")["Secondary_Sales_Qty"]
-        .sum().reset_index()
-        .rename(columns={"Secondary_Sales_Qty": "Current_Month_Sales"})
-    )
+    # ── Actual sales with ALL-SKU fallback ────────────────────────────────
+    # processed_data_actual.csv (actuals_df) covers FOCUS SKUs only. A
+    # model-forecasted SKU whose sales history lives only in
+    # fact_monthly_closed (all_sales_df) would otherwise read 0 here even
+    # though it genuinely sold — combine_first fills gaps from the
+    # all-SKU source without overriding a real focus-side number.
+    def _sales_with_fallback(month_dt, out_col):
+        primary = (
+            actuals_df[actuals_df["Month_dt"] == month_dt]
+            .groupby("ItemCode")["Secondary_Sales_Qty"].sum()
+        )
+        if not all_sales_df.empty:
+            fallback = (
+                all_sales_df[all_sales_df["Month_dt"] == month_dt]
+                .groupby("ItemCode")["Sales_Qty"].sum()
+            )
+            combined = primary.combine_first(fallback)
+        else:
+            combined = primary
+        out = combined.reset_index()
+        out.columns = ["ItemCode", out_col]
+        return out
+
+    cur_sales  = _sales_with_fallback(latest_month_dt, "Current_Month_Sales")
     prev_sales = (
-        prev_month_actuals.groupby("ItemCode")["Secondary_Sales_Qty"]
-        .sum().reset_index()
-        .rename(columns={"Secondary_Sales_Qty": "Last_Month_Sales"})
+        _sales_with_fallback(all_months[-2], "Last_Month_Sales")
+        if len(all_months) >= 2
+        else pd.DataFrame(columns=["ItemCode", "Last_Month_Sales"])
     )
 
     latest_forecast = (
@@ -1199,6 +1467,7 @@ def build_agency_performance_table():
     df = df.merge(wmape_lookup, on="ItemCode", how="left")
     df = df.merge(agency_map,   on="ItemCode", how="left")
     df = df.merge(shp_lookup,   on="ItemCode", how="left")
+    df = df.merge(price_lookup, on="ItemCode", how="left")
 
     # ── Resolve Current_Month_Sales: loss_lookup has it; cur_sales also has it.
     # After merges, if "Current_Month_Sales_x" / "_y" exist, pick the right one.
@@ -1256,12 +1525,33 @@ def build_agency_performance_table():
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
 
+    # ── Value fields — SALES/FORECAST only use distributor (RD) price ────────
+    # Budget's own value fields (Budget_Value/Annual_Budget_Value) live in
+    # budget_table and are computed with Budget_Price there — never here.
+    df["Distributor_Unit_Price"] = pd.to_numeric(df.get("Distributor_Unit_Price"), errors="coerce")
+    df["Price_Source"] = np.where(df["Distributor_Unit_Price"].notna(), "DISTRIBUTOR", "NONE")
+    _price = df["Distributor_Unit_Price"].fillna(0)
+
+    df["Current_Month_Sales_Value"]    = (df["Current_Month_Sales"]    * _price).round(2)
+    df["Current_Month_Forecast_Value"] = (df["Current_Month_Forecast"].fillna(0) * _price).round(2)
+    df["Next_Month_Forecast_Value"]    = (df["Next_Month_Forecast"]    * _price).round(2)
+
+    # ── Master-scope flag — every KPI total sums ONLY rows where this is True.
+    # Some FOCUS SKUs (model-forecasted) have no entry in Budget.xlsx at all,
+    # so they're absent from sku_master_full.csv. They still appear in the
+    # per-SKU table below (nothing is silently dropped), just excluded from
+    # summed KPIs so totals don't mix two different SKU universes.
+    df["Is_In_Master"] = df["ItemCode"].isin(master_codes)
+
     output_cols = [
-        "Agency", "ItemCode", "ItemName",
+        "Agency", "ItemCode", "ItemName", "Is_In_Master",
         "Data_Available_Upto", "Forecast_Month",
         "Last_Month_Sales", "Current_Month_Sales",
         "Current_Month_Forecast", "Next_Month_Forecast",
         "MoM_Growth_%",
+        "Distributor_Unit_Price", "Price_Source",
+        "Current_Month_Sales_Value", "Current_Month_Forecast_Value",
+        "Next_Month_Forecast_Value",
         "Model_Used", "Model_WMAPE", "Model_Accuracy_%",
         "Realised_Accuracy_%", "Realised_Accuracy_Available",
         "L3M_Moving_Avg", "WH_Stock", "DB_Stock",
@@ -1280,23 +1570,39 @@ def build_agency_performance_table():
     budget_table = build_budget_analysis_table(
         budget_sku_lookup, budget_meta,
         actuals_df, agency_map, loss_lookup,
-        latest_month_dt,
+        latest_month_dt, price_lookup,
         all_sales_df=all_sales_df, trend_lookup=trend_lookup,
     )
     budget_result = budget_table.where(pd.notnull(budget_table), other=None)
 
-    # ── Forecast comparison table (Forecast tab — budgeted SKUs, same month
-    # the UI is currently showing = next_forecast_month_dt / next_forecast_label) ─
+    # ── Forecast comparison table (Forecast tab) ──────────────────────────────
+    # Targets the CURRENTLY DISPLAYED Insights month (latest closed month,
+    # e.g. May) — not the next/future forecast month (June) — because this
+    # table's whole purpose is a three-way check: my forecast vs their
+    # forecast vs what actually happened, and actuals only exist for a
+    # closed month.
+    #
+    # "My_Model_Forecast_Qty" here is deliberately the HISTORICALLY ISSUED
+    # forecast for the current month (Current_Month_Forecast, sourced from
+    # forecast_horizon_history via loss_lookup) — not Next_Month_Forecast,
+    # which targets the future month and has no actual to compare against.
     own_forecast_lookup = (
-        latest_forecast[["ItemCode", "Next_Month_Forecast"]]
-        .rename(columns={"Next_Month_Forecast": "My_Model_Forecast_Qty"})
+        df[["ItemCode", "Current_Month_Forecast"]]
+        .rename(columns={"Current_Month_Forecast": "My_Model_Forecast_Qty"})
+        .drop_duplicates("ItemCode")
         .copy()
     )
-    external_forecast_df = load_external_forecast_comparison(next_forecast_month_dt)
+    actual_sales_lookup = (
+        df[["ItemCode", "Current_Month_Sales"]]
+        .rename(columns={"Current_Month_Sales": "Actual_Sales_Qty"})
+        .drop_duplicates("ItemCode")
+        .copy()
+    )
+    external_forecast_df = load_external_forecast_comparison(latest_month_dt)
     forecast_comparison_table = build_forecast_comparison_table(
         budget_sku_lookup, agency_map,
-        own_forecast_lookup, external_forecast_df,
-        next_forecast_label,
+        own_forecast_lookup, actual_sales_lookup, external_forecast_df,
+        data_upto_label,
     )
     forecast_comparison_result = forecast_comparison_table.where(
         pd.notnull(forecast_comparison_table), other=None
@@ -1313,19 +1619,32 @@ def build_agency_performance_table():
             return 0
         return int(pd.to_numeric(frame[col], errors="coerce").fillna(0).sum())
 
-    total_sales    = _fsum(result, "Current_Month_Sales")
-    total_cur_fcst = _fsum(result, "Current_Month_Forecast")
+    # Performance-table totals: master-scoped only (see Is_In_Master above).
+    result_scoped = (
+        result[result["Is_In_Master"] == True] if "Is_In_Master" in result.columns else result
+    )
+    total_sales             = _fsum(result_scoped, "Current_Month_Sales")
+    total_sales_value       = _fsum(result_scoped, "Current_Month_Sales_Value")
+    total_cur_fcst          = _fsum(result_scoped, "Current_Month_Forecast")
+    total_cur_fcst_value    = _fsum(result_scoped, "Current_Month_Forecast_Value")
+    total_next_fcst         = _fsum(result_scoped, "Next_Month_Forecast")
+    total_next_fcst_value   = _fsum(result_scoped, "Next_Month_Forecast_Value")
 
-    # Budget totals come from ALL budgeted items (never focus items only)
+    excluded_row_count = int((result["Is_In_Master"] == False).sum()) if "Is_In_Master" in result.columns else 0
+
+    # Budget totals come from ALL budgeted items — budget_table is inherently
+    # master-scoped already (every row originates from sku_master_full.csv
+    # via load_budget_lookup), so no extra filter needed here.
     total_budget_qty        = _fsum(budget_table, "Budget_Qty")
     total_annual_budget_qty = _fsum(budget_table, "Annual_Budget_Qty")
     total_fytd_sales_qty    = _fsum(budget_table, "FYTD_Sales_Qty")
 
-    # Value totals (budgeted unit price × qty)
+    # Value totals — Budget_* stay on Budget_Price; sales/forecast on
+    # Distributor_Unit_Price (see build_budget_analysis_table docstring).
     total_budget_value         = _fsum(budget_table, "Budget_Value")
     total_annual_budget_value  = _fsum(budget_table, "Annual_Budget_Value")
     total_fytd_sales_value     = _fsum(budget_table, "FYTD_Sales_Value")
-    total_cur_sales_value      = _fsum(budget_table, "Current_Month_Sales_Value")
+    total_cur_sales_value_bt   = _fsum(budget_table, "Current_Month_Sales_Value")
 
     agency_budget_records = []
     if not budget_table.empty:
@@ -1348,11 +1667,19 @@ def build_agency_performance_table():
     forecast_comparison_sku_count = int(len(forecast_comparison_table))
     forecast_comparison_matched_count = 0
     if not forecast_comparison_table.empty:
-        any_external = forecast_comparison_table[[
-            "Approved_Consensus_Forecast_Qty", "Best_Fit_With_MI_Forecast_Qty",
-            "Consensus_Forecast_Qty", "Final_Forecast_Qty",
-        ]].notna().any(axis=1)
-        forecast_comparison_matched_count = int(any_external.sum())
+        external_value_cols = [
+            c for c in forecast_comparison_table.columns
+            if c.endswith("_Forecast_Qty") and c != "My_Model_Forecast_Qty"
+        ]
+        if external_value_cols:
+            any_external = forecast_comparison_table[external_value_cols].notna().any(axis=1)
+            forecast_comparison_matched_count = int(any_external.sum())
+
+    # Price coverage — how many master SKUs got a real distributor price
+    # vs fell back vs have none at all (useful debug/QA signal for the UI).
+    price_source_counts = {}
+    if "Price_Source" in result_scoped.columns and not result_scoped.empty:
+        price_source_counts = result_scoped["Price_Source"].value_counts().to_dict()
 
     meta = {
         "data_available_upto":         data_upto_label,
@@ -1365,14 +1692,26 @@ def build_agency_performance_table():
         "total_skus":                  int(len(result)),
         "agencies":                    sorted(result["Agency"].dropna().unique().tolist()),
 
-        # Loss (per-SKU decomposition, forecasted items)
-        "total_raw_loss_qty":           _fsum(result, "Raw_Loss_Qty"),
-        "total_other_loss_qty":         _fsum(result, "Other_Loss_Qty"),
-        "total_stockout_loss_qty":      _fsum(result, "Stockout_Loss_Qty"),
-        "total_current_month_loss_qty": _fsum(result, "Current_Month_Loss_Qty"),
-        "stockout_sku_count":           _isum(result, "Stockout_Flag"),
+        # Master-scope diagnostics
+        "master_sku_count":            len(master_codes),
+        "excluded_from_totals_count":  excluded_row_count,
 
-        # Budget (ALL budgeted items)
+        # Loss (per-SKU decomposition, forecasted items, master-scoped)
+        "total_raw_loss_qty":           _fsum(result_scoped, "Raw_Loss_Qty"),
+        "total_other_loss_qty":         _fsum(result_scoped, "Other_Loss_Qty"),
+        "total_stockout_loss_qty":      _fsum(result_scoped, "Stockout_Loss_Qty"),
+        "total_current_month_loss_qty": _fsum(result_scoped, "Current_Month_Loss_Qty"),
+        "stockout_sku_count":           _isum(result_scoped, "Stockout_Flag"),
+
+        # Performance KPI strip — qty AND value (value = the primary display)
+        "total_actual_sales_qty":       total_sales,
+        "total_actual_sales_value":     total_sales_value,        # distributor price
+        "total_current_forecast_qty":   total_cur_fcst,
+        "total_current_forecast_value": total_cur_fcst_value,     # distributor price
+        "total_next_forecast_qty":      total_next_fcst,
+        "total_next_forecast_value":    total_next_fcst_value,    # distributor price
+
+        # Budget (ALL budgeted items — Budget_* always at Budget_Price)
         "budget_item_count":        int(len(budget_table)),
         "unmapped_budget_item_count": (
             int(budget_table["Is_Unmapped"].sum())
@@ -1382,14 +1721,16 @@ def build_agency_performance_table():
         "total_annual_budget_qty":  total_annual_budget_qty,
         "total_fytd_sales_qty":     total_fytd_sales_qty,
 
-        # Value totals (budgeted unit price × qty; sales valued at budget price)
-        "total_budget_value":              total_budget_value,
-        "total_annual_budget_value":       total_annual_budget_value,
-        "total_fytd_sales_value":          total_fytd_sales_value,
-        "total_current_month_sales_value": total_cur_sales_value,
+        "total_budget_value":              total_budget_value,        # budget price
+        "total_annual_budget_value":       total_annual_budget_value, # budget price
+        "total_fytd_sales_value":          total_fytd_sales_value,    # distributor price
+        "total_current_month_sales_value": total_cur_sales_value_bt,  # distributor price
         "budget_fy_months":         budget_meta.get("month_labels", []),
         "budget_current_month_found": budget_meta.get("current_month_found", False),
         "agency_budget":            agency_budget_records,
+
+        # Price coverage diagnostics
+        "price_source_counts":      price_source_counts,
 
         # Forecast coverage of the budgeted-SKU universe
         # (MODEL = champion model, TREND = simple background analysis,
@@ -1407,7 +1748,9 @@ def build_agency_performance_table():
         "total_budget_vs_actual_loss_qty":   max(total_budget_qty - total_sales, 0.0),
         "total_forecast_vs_actual_loss_qty": max(total_cur_fcst  - total_sales, 0.0),
 
-        # Forecast comparison tab coverage
+        # Forecast comparison tab — targets the CURRENT (closed) month, not
+        # the future forecast month, so it can include actuals.
+        "forecast_comparison_month":             data_upto_label,
         "forecast_comparison_sku_count":         forecast_comparison_sku_count,
         "forecast_comparison_matched_sku_count": forecast_comparison_matched_count,
     }
