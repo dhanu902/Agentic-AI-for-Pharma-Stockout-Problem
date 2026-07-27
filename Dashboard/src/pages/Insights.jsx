@@ -1,9 +1,13 @@
 // src/pages/Insights.jsx
 //
-// UI v2 — visual upgrade only. All KPIs, data flow, sorting, filtering,
-// pagination and calculations are IDENTICAL to v1 for the existing tabs.
-// Added: Forecast tab (table only, no KPI cards) comparing our model's
-// forecast against third-party forecasts for the budgeted SKU universe.
+// UI v3 — value-primary KPI strip (distributor price for actual sales/
+// forecast, budget price for budget qty — see insights_engine.py pricing
+// rule), master-SKU-scoped totals, RD (distributor) price surfaced in the
+// Budget Analysis table, and a rebuilt Forecast tab that now compares our
+// model vs third-party forecasts vs ACTUAL sales for the closed month
+// (with a per-source accuracy badge), replacing the old "vs next month"
+// framing. Table logic, pagination and sort mechanics are otherwise
+// unchanged from v2.
 
 import React, { useEffect, useMemo, useState } from "react";
 import T from "../theme";
@@ -11,7 +15,7 @@ import T from "../theme";
 const API_BASE = "/api/insights";
 const PAGE_SIZE = 20;
 
-/* ─── Helpers (unchanged) ────────────────────────────────────── */
+/* ─── Helpers ─────────────────────────────────────────────────── */
 function toNumber(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 function formatNum(v, d = 0) { return toNumber(v).toLocaleString(undefined, { maximumFractionDigits: d }); }
 function pct(v) { return toNumber(v).toFixed(1) + "%"; }
@@ -37,6 +41,11 @@ function budgetReachColor(v) {
   const n = toNumber(v);
   return n >= 100 ? T.green : n >= 80 ? T.amber : T.red;
 }
+
+/* A row counts toward master-scoped KPI totals unless explicitly flagged
+   false. Undefined/null (older cached data, or tables that never carry
+   the flag) defaults to "included" so nothing silently zeroes out. */
+function isMasterScoped(r) { return r.Is_In_Master !== false; }
 
 /* ─── Design tokens (UI only) ────────────────────────────────── */
 const FONT_UI   = "'Inter', 'IBM Plex Sans', sans-serif";
@@ -124,14 +133,14 @@ function GlyphIcon({ glyph, color, size = 26 }) {
   );
 }
 
-/* ─── KPI Card (same data, elevated presentation) ────────────── */
+/* ─── KPI Card ────────────────────────────────────────────────── */
 function Kpi({ label, value, color, sub, glyph, delay = 0 }) {
   const col = color || T.blue;
   return (
     <div className="ins-kpi ins-anim" style={{
       animationDelay: `${delay}ms`,
       background: T.card, border: `1px solid ${T.border}`, borderRadius: 14,
-      padding: "16px 18px", flex: 1, minWidth: 140, position: "relative",
+      padding: "16px 18px", flex: 1, minWidth: 150, position: "relative",
       overflow: "hidden", boxShadow: SHADOW_SM }}>
       {/* soft corner glow */}
       <div style={{ position: "absolute", top: -30, right: -30, width: 110, height: 110,
@@ -145,6 +154,45 @@ function Kpi({ label, value, color, sub, glyph, delay = 0 }) {
       <div style={{ fontSize: 22, fontWeight: 900, color: col, fontFamily: FONT_MONO,
         lineHeight: 1, letterSpacing: -0.5, fontVariantNumeric: "tabular-nums" }}>{value}</div>
       {sub && <div style={{ fontSize: 10.5, color: T.muted, marginTop: 6, fontWeight: 500 }}>{sub}</div>}
+      <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 3,
+        background: `linear-gradient(90deg, ${col}, ${col}22 70%, transparent)` }} />
+    </div>
+  );
+}
+
+/* Value-primary KPI card: big compact value (full figure in title/tooltip
+   and sub-line), small qty line underneath. Used for the first 3 cards in
+   the Performance strip per the "value form, qty as detail" requirement. */
+function ValueKpi({ label, value, qty, qtyLabel, color, glyph, delay = 0, priceNote }) {
+  const col = color || T.blue;
+  return (
+    <div className="ins-kpi ins-anim" style={{
+      animationDelay: `${delay}ms`,
+      background: T.card, border: `1px solid ${T.border}`, borderRadius: 14,
+      padding: "16px 18px", flex: 1, minWidth: 170, position: "relative",
+      overflow: "hidden", boxShadow: SHADOW_SM }}>
+      <div style={{ position: "absolute", top: -30, right: -30, width: 110, height: 110,
+        background: `radial-gradient(circle, ${col}26, transparent 70%)`,
+        pointerEvents: "none" }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        {glyph && <GlyphIcon glyph={glyph} color={col} size={24} />}
+        <span style={{ fontSize: 9.5, color: T.muted, textTransform: "uppercase",
+          letterSpacing: 1.4, fontWeight: 800 }}>{label}</span>
+      </div>
+      <div title={formatNum(value)} style={{ fontSize: 22, fontWeight: 900, color: col,
+        fontFamily: FONT_MONO, lineHeight: 1, letterSpacing: -0.5,
+        fontVariantNumeric: "tabular-nums" }}>
+        {formatCompact(value)}
+      </div>
+      <div style={{ fontSize: 10.5, color: T.muted, marginTop: 6, fontWeight: 600,
+        display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+        <span style={{ color: T.text, fontWeight: 800, fontFamily: FONT_MONO }}>{formatNum(qty)}</span>
+        <span>{qtyLabel || "units"}</span>
+        {priceNote && (
+          <span style={{ marginLeft: "auto", fontSize: 8.5, fontWeight: 800,
+            color: T.muted, textTransform: "uppercase", letterSpacing: 0.6 }}>{priceNote}</span>
+        )}
+      </div>
       <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 3,
         background: `linear-gradient(90deg, ${col}, ${col}22 70%, transparent)` }} />
     </div>
@@ -170,7 +218,7 @@ function Gauge({ value, color, size = 62, stroke = 6 }) {
   );
 }
 
-/* ─── Ratio KPI card with gauge (same values as before) ──────── */
+/* ─── Ratio KPI card with gauge ───────────────────────────────── */
 function RatioKpi({ label, value, sub, delay = 0 }) {
   const col = budgetReachColor(value);
   const over = value != null && toNumber(value) > 100;
@@ -207,7 +255,7 @@ function RatioKpi({ label, value, sub, delay = 0 }) {
   );
 }
 
-/* ─── Budget reach mini-bar (unchanged logic) ────────────────── */
+/* ─── Budget reach mini-bar ───────────────────────────────────── */
 function BudgetBar({ reach, label }) {
   if (reach == null) return <span style={{ color: T.muted, fontSize: 10 }}>—</span>;
   const n    = Math.min(toNumber(reach), 100);   // cap at 100 for bar width
@@ -304,7 +352,7 @@ function InfoTag({ text, color }) {
   );
 }
 
-/* ─── Dual Accuracy Cell (same content, refined chrome) ──────── */
+/* ─── Dual Accuracy Cell ──────────────────────────────────────── */
 function DualAccuracyCell({ modelAcc, realisedAcc, realisedAvailable, modelUsed, bg }) {
   return (
     <td style={{ borderBottom: `1px solid ${T.border}`, padding: "12px 14px",
@@ -353,7 +401,7 @@ function DualAccuracyCell({ modelAcc, realisedAcc, realisedAvailable, modelUsed,
   );
 }
 
-/* ─── Loss breakdown cell (same content) ─────────────────────── */
+/* ─── Loss breakdown cell ─────────────────────────────────────── */
 function LossCell({ row, bg }) {
   const raw      = toNumber(row.Raw_Loss_Qty);
   const stockout = toNumber(row.Stockout_Loss_Qty);
@@ -406,7 +454,7 @@ function ReasonBadge({ reason }) {
   return <InfoTag text={c.label} color={c.color} />;
 }
 
-/* ─── Pagination (same logic, refreshed look) ────────────────── */
+/* ─── Pagination ──────────────────────────────────────────────── */
 function Pagination({ page, setPage, total, pageSize = PAGE_SIZE, accent }) {
   const totalPages = Math.ceil(total / pageSize);
   if (totalPages <= 1) return null;
@@ -415,7 +463,6 @@ function Pagination({ page, setPage, total, pageSize = PAGE_SIZE, accent }) {
   const start = (page - 1) * pageSize + 1;
   const end = Math.min(page * pageSize, total);
 
-  // Windowed page numbers: first, last, and a few around current
   const pages = [];
   const windowSize = 1;
   for (let p = 1; p <= totalPages; p++) {
@@ -510,11 +557,18 @@ const tdBase = {
   fontVariantNumeric: "tabular-nums",
 };
 
+/* Budget table now surfaces BOTH prices — Budget Price (primary, values
+   Budget/Annual Budget) and RD Price (distributor, values Sales/FYTD) —
+   plus their derived value columns, per the pricing rule in
+   insights_engine.py: budget qty is PRIMARY movement, sales/forecast qty
+   is SECONDARY (distributor) movement, and they must never share a price. */
 const BUDGET_COLS = [
-  "#", "Agency", "Item Code", "Item Name", "Price",
-  "Budget (Month)", "Budget Value", "Actual Sales", "Achievement",
-  "Cur Forecast", "Possible (Fcst)",
-  "Annual Budget", "FYTD Sales", "Annual Progress",
+  "#", "Agency", "Item Code", "Item Name",
+  "Budget Price", "RD Price",
+  "Budget (Month)", "Budget Value",
+  "Actual Sales", "Sales Value", "Achievement",
+  "Cur Forecast", "Forecast Value", "Possible (Fcst)",
+  "Annual Budget", "FYTD Sales", "FYTD Value", "Annual Progress",
 ];
 
 const PERF_COLS = [
@@ -531,11 +585,12 @@ const LOSS_COLS = [
   "Raw Loss", "Stockout Loss", "Other Loss", "Reason",
 ];
 
-/* Forecast tab — model vs third-party forecasts, budgeted SKUs only.
-   Table only, no KPI cards above it. */
+/* Forecast tab — model vs third-party forecasts vs ACTUAL sales, for the
+   currently displayed (closed) month. Table only, no KPI cards above it. */
 const FORECAST_COLS = [
-  "#", "Agency", "Item Code", "Item Name", "Forecast Month",
-  "My Model", "Approved Consensus", "Best Fit With MI", "Consensus", "Final Forecast",
+  "#", "Agency", "Item Code", "Item Name", "Month",
+  "Actual Sales",
+  "My Model", "Approved Consensus", "Best Fit With MI", "Consensus", "Final Forecast", "3MA Deviation",
 ];
 
 function SortBtn({ col, label, sortCol, setSortCol, accent }) {
@@ -557,9 +612,29 @@ function SortBtn({ col, label, sortCol, setSortCol, accent }) {
   );
 }
 
+/* Compact qty + accuracy cell used in the Forecast tab: bold qty on top,
+   a small colour-coded "X% acc" line under it when we have an actual to
+   compare against. Distinguishes the "my model" column with a teal tint. */
+function ForecastQtyCell({ qty, accuracy, bg, emphasize }) {
+  return (
+    <td style={{ ...tdBase, background: bg, textAlign: "right", verticalAlign: "top", minWidth: 108 }}>
+      <div style={{ color: qty != null ? (emphasize ? T.teal : T.text) : T.muted,
+        fontWeight: qty != null ? 900 : 400, fontSize: emphasize ? 12.5 : 11 }}>
+        {qty != null ? formatNum(qty) : "—"}
+      </div>
+      {accuracy != null ? (
+        <div style={{ fontSize: 9, color: accColor(accuracy), marginTop: 3, fontWeight: 800 }}>
+          {accLabel(accuracy)} acc
+        </div>
+      ) : qty != null ? (
+        <div style={{ fontSize: 9, color: T.muted, marginTop: 3 }}>—</div>
+      ) : null}
+    </td>
+  );
+}
+
 /* ═══════════════════════════════════════════════════════════════
-   MAIN COMPONENT — all state / data logic identical to v1,
-   plus a new Forecast tab (table only).
+   MAIN COMPONENT
 ════════════════════════════════════════════════════════════════ */
 export default function Insights() {
   const [rows, setRows]             = useState([]);
@@ -637,6 +712,15 @@ export default function Insights() {
     agency ? forecastRows.filter(r => r.Agency === agency) : forecastRows,
   [forecastRows, agency]);
 
+  // KPI totals scope to master-SKU rows only (Is_In_Master !== false) —
+  // mirrors insights_engine.py: a focus SKU with no budget entry still
+  // appears in the table below, but is excluded from summed KPIs so
+  // totals don't mix two different SKU universes. budget_rows are already
+  // entirely master-scoped by construction (built from sku_master_full.csv),
+  // so no extra filter is needed there.
+  const masterScoped = useMemo(() => filtered.filter(isMasterScoped), [filtered]);
+  const excludedCount = filtered.length - masterScoped.length;
+
   const budgetTableRows = useMemo(() =>
     [...filteredBudget].sort((a, b) => {
       const av = a[sortBudget], bv = b[sortBudget];
@@ -681,26 +765,39 @@ export default function Insights() {
     agency ? forecastTableRows : forecastTableRows.slice((forecastPage - 1) * PAGE_SIZE, forecastPage * PAGE_SIZE),
   [forecastTableRows, agency, forecastPage]);
 
-  /* ── KPI summaries (identical to v1) ── */
+  /* ── KPI summaries ──
+     Qty totals: master-scoped only (see masterScoped above).
+     Value totals: sales/forecast valued at DISTRIBUTOR price
+     (Current_Month_Sales_Value / Current_Month_Forecast_Value, computed
+     backend-side from Inventory.xlsx DB-sheet UnitPrice). Budget qty/value
+     always come from Budget_Qty/Budget_Value in budget_rows, valued at
+     BUDGET price — the two price bases are never mixed (see
+     insights_engine.py pricing rule). */
   const kpi = useMemo(() => {
-    const d = filtered;
-    const totalSales    = d.reduce((s, r) => s + toNumber(r.Current_Month_Sales), 0);
-    const totalCurFcst  = d.reduce((s, r) => s + toNumber(r.Current_Month_Forecast), 0);
+    const d = masterScoped;
+    const totalSalesQty    = d.reduce((s, r) => s + toNumber(r.Current_Month_Sales), 0);
+    const totalSalesValue  = d.reduce((s, r) => s + toNumber(r.Current_Month_Sales_Value), 0);
+    const totalCurFcstQty  = d.reduce((s, r) => s + toNumber(r.Current_Month_Forecast), 0);
+    const totalCurFcstValue= d.reduce((s, r) => s + toNumber(r.Current_Month_Forecast_Value), 0);
 
-    // Budget totals from ALL budgeted items (some have budget but no sale)
+    // Budget totals from ALL budgeted items (some have budget but no sale) —
+    // already master-scoped by construction.
     const bd = filteredBudget;
     const totalBudget       = bd.reduce((s, r) => s + toNumber(r.Budget_Qty), 0);
     const totalAnnualBudget = bd.reduce((s, r) => s + toNumber(r.Annual_Budget_Qty), 0);
     const totalFytdSales    = bd.reduce((s, r) => s + toNumber(r.FYTD_Sales_Qty), 0);
 
-    // Value totals (budgeted unit price x qty; sales valued at budget price)
+    // Budget value: ALWAYS budget price (primary movement).
     const totalBudgetValue       = bd.reduce((s, r) => s + toNumber(r.Budget_Value), 0);
     const totalAnnualBudgetValue = bd.reduce((s, r) => s + toNumber(r.Annual_Budget_Value), 0);
+    // FYTD sales value: distributor price (secondary movement).
     const totalFytdSalesValue    = bd.reduce((s, r) => s + toNumber(r.FYTD_Sales_Value), 0);
 
-    // Aggregate gaps for the Performance KPI strip
-    const budgetVsActualLoss   = Math.max(totalBudget  - totalSales, 0);
-    const forecastVsActualLoss = Math.max(totalCurFcst - totalSales, 0);
+    // Aggregate gaps for the Performance KPI strip (qty — mixing budget
+    // and forecast/actual value bases in a single "gap" number isn't
+    // meaningful, so this stays qty-only as before).
+    const budgetVsActualLoss   = Math.max(totalBudget    - totalSalesQty, 0);
+    const forecastVsActualLoss = Math.max(totalCurFcstQty - totalSalesQty, 0);
 
     const totalRaw      = d.reduce((s, r) => s + toNumber(r.Raw_Loss_Qty), 0);
     const totalStockout = d.reduce((s, r) => s + toNumber(r.Stockout_Loss_Qty), 0);
@@ -711,14 +808,14 @@ export default function Insights() {
       d.filter(r => toNumber(r.Raw_Loss_Qty) > 0).map(r => r.Agency).filter(Boolean)
     ).size;
 
-    const budgetReach  = totalBudget > 0 ? (totalSales   / totalBudget) * 100 : null;
-    const fcstVsBudget = totalBudget > 0 ? (totalCurFcst / totalBudget) * 100 : null;
+    const budgetReach  = totalBudget > 0 ? (totalSalesQty   / totalBudget) * 100 : null;
+    const fcstVsBudget = totalBudget > 0 ? (totalCurFcstQty / totalBudget) * 100 : null;
 
     // FY progress: FYTD actual sales vs full-year budget
     const annualReach = totalAnnualBudget > 0 ? (totalFytdSales / totalAnnualBudget) * 100 : null;
 
     return {
-      totalSales, totalCurFcst,
+      totalSalesQty, totalSalesValue, totalCurFcstQty, totalCurFcstValue,
       totalBudget, totalAnnualBudget, totalFytdSales,
       totalBudgetValue, totalAnnualBudgetValue, totalFytdSalesValue,
       budgetVsActualLoss, forecastVsActualLoss,
@@ -728,7 +825,7 @@ export default function Insights() {
       recoverablePct: totalRaw > 0 ? (totalOther / totalRaw) * 100 : null,
       unrecoverablePct: totalRaw > 0 ? (totalStockout / totalRaw) * 100 : null,
     };
-  }, [filtered, filteredBudget]);
+  }, [masterScoped, filteredBudget]);
 
   const tabAccent = activeTab === "loss" ? T.red
     : activeTab === "performance" ? T.blue
@@ -788,6 +885,13 @@ export default function Insights() {
                       Budget month · {meta.current_month_label}
                     </span>
                   )}
+                  {excludedCount > 0 && (
+                    <span title="Forecasted SKUs with no entry in the budget master list — excluded from KPI totals below, still visible in the Performance table"
+                      style={{ background: T.amber + "12", border: `1px solid ${T.amber}2E`,
+                      borderRadius: 999, padding: "2px 10px", fontWeight: 700, color: T.amber }}>
+                      {excludedCount} SKU{excludedCount === 1 ? "" : "s"} excluded from totals (not budgeted)
+                    </span>
+                  )}
                 </>
               ) : "SKU-wise sales, forecast accuracy, budget reach, and stockout loss."}
             </div>
@@ -832,25 +936,47 @@ export default function Insights() {
       )}
 
       {/* ══════════════════════════════════════════════════════════
-          KPI STRIP — Row 1: Performance (same KPIs)
+          KPI STRIP — Row 1: Performance
+          First 3 cards are VALUE-primary (compact ₨ figure, qty as the
+          detail line): Budget uses Budget_Price, Actual Sales & Current
+          Forecast use Distributor_Unit_Price (RD price) — see the pricing
+          rule note in insights_engine.py.
       ═════════════════════════════════════════════════════════= */}
       <SectionLabel accent={T.blue}>Performance — {agency || "All Agencies"}</SectionLabel>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 20 }}>
-        <Kpi glyph="▦" delay={0}   label="Budget (Month QTY)"     value={formatNum(kpi.totalBudget)}  color={T.purple} sub="All budgeted items" />
-        <Kpi glyph="◧" delay={40}  label="Actual Sales (QTY)" value={formatNum(kpi.totalSales)}   color={T.sky} />
-        <Kpi glyph="◔" delay={80}  label="Current Forecast (QTY)"   value={formatNum(kpi.totalCurFcst)} color={T.amber} />
+        <ValueKpi glyph="▦" delay={0}
+          label="Budget (Month)"
+          value={kpi.totalBudgetValue}
+          qty={kpi.totalBudget} qtyLabel="budgeted units"
+          color={T.purple}
+          priceNote="Budget price" />
+
+        <ValueKpi glyph="◧" delay={40}
+          label="Actual Sales"
+          value={kpi.totalSalesValue}
+          qty={kpi.totalSalesQty} qtyLabel="units sold"
+          color={T.sky}
+          priceNote="RD price" />
+
+        <ValueKpi glyph="◔" delay={80}
+          label="Current Forecast"
+          value={kpi.totalCurFcstValue}
+          qty={kpi.totalCurFcstQty} qtyLabel="forecast units"
+          color={T.amber}
+          priceNote="RD price" />
+
         <Kpi glyph="▼" delay={120} label="Loss — Budget vs Actual"
           value={kpi.budgetVsActualLoss > 0 ? formatNum(kpi.budgetVsActualLoss) : "—"}
           color={kpi.budgetVsActualLoss > 0 ? T.red : T.green}
-          sub="Budget − Actual sales" />
+          sub="Budget − Actual sales (qty)" />
         <Kpi glyph="▽" delay={160} label="Loss — Forecast vs Actual"
           value={kpi.forecastVsActualLoss > 0 ? formatNum(kpi.forecastVsActualLoss) : "—"}
           color={kpi.forecastVsActualLoss > 0 ? T.red : T.green}
-          sub="Forecast − Actual sales" />
+          sub="Forecast − Actual sales (qty)" />
       </div>
 
       {/* ══════════════════════════════════════════════════════════
-          KPI STRIP — Row 2: Budget (same KPIs, gauges for ratios)
+          KPI STRIP — Row 2: Budget
       ═════════════════════════════════════════════════════════= */}
       <SectionLabel accent={T.purple}>Budget — {agency || "All Agencies"}
         {meta?.current_month_label && <span style={{ marginLeft: 6, fontWeight: 900 }}>({meta.current_month_label})</span>}
@@ -880,7 +1006,9 @@ export default function Insights() {
           sub="Forecast alignment" />
       </div>
 
-      {/* Row B — value (budgeted unit price × qty); compact display, full figure in sub */}
+      {/* Row B — value. Budget_* stays at BUDGET price (primary movement);
+          FYTD Sales Value uses DISTRIBUTOR price (secondary movement) —
+          never the same price basis, per the pricing rule. */}
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 22 }}>
         <Kpi glyph="＄" delay={60} label="Annual Budget Value"
           value={<span title={formatNum(kpi.totalAnnualBudgetValue)}>{formatCompact(kpi.totalAnnualBudgetValue)}</span>}
@@ -890,16 +1018,16 @@ export default function Insights() {
         <Kpi glyph="＄" delay={90} label="Budget Value (Month)"
           value={<span title={formatNum(kpi.totalBudgetValue)}>{formatCompact(kpi.totalBudgetValue)}</span>}
           color={T.purple}
-          sub={`${formatNum(kpi.totalBudgetValue)} · ${meta?.current_month_label || "current month"}`} />
+          sub={`${formatNum(kpi.totalBudgetValue)} · ${meta?.current_month_label || "current month"} · at budget price`} />
 
         <Kpi glyph="＄" delay={120} label="FYTD Sales Value"
           value={<span title={formatNum(kpi.totalFytdSalesValue)}>{formatCompact(kpi.totalFytdSalesValue)}</span>}
           color={T.teal}
-          sub={`${formatNum(kpi.totalFytdSalesValue)} · at budget price`} />
+          sub={`${formatNum(kpi.totalFytdSalesValue)} · at RD (distributor) price`} />
       </div>
 
       {/* ══════════════════════════════════════════════════════════
-          KPI STRIP — Row 3: Stockout Loss (same KPIs)
+          KPI STRIP — Row 3: Stockout Loss
       ═════════════════════════════════════════════════════════= */}
       <SectionLabel accent={T.red}>
         Stockout Loss
@@ -965,12 +1093,12 @@ export default function Insights() {
             </div>
             <div style={{ fontSize: 10.5, color: T.muted }}>
               {activeTab === "budget"
-                ? "All budgeted items · monthly achievement (actual & forecast vs budget) · annual progress"
+                ? "All budgeted items · budget @ budget price, sales/forecast @ RD (distributor) price · annual progress"
                 : activeTab === "performance"
                 ? "Forecast accuracy · MoM growth · stockout loss · SHP"
                 : activeTab === "loss"
                 ? "Per-SKU loss decomposition: Raw = Stockout + Other (stock-covered gap)"
-                : `Our model vs third-party forecasts for ${meta?.forecast_month || "the current forecast month"} · budgeted SKUs only`}
+                : `Our model vs third-party forecasts vs actual sales for ${meta?.forecast_comparison_month || meta?.current_month_label || "the current closed month"} · budgeted SKUs only`}
             </div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
@@ -979,6 +1107,7 @@ export default function Insights() {
               <>
                 <SortBtn col="Budget_Qty"             label="Budget"       sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Budget_Value"           label="Value"        sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
+                <SortBtn col="Current_Month_Sales_Value" label="Sales Value" sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Achievement_%"          label="Achievement"  sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Possible_Achievement_%" label="Possible"     sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
                 <SortBtn col="Annual_Budget_Qty"      label="Annual"       sortCol={sortBudget} setSortCol={setSortBudget} accent={T.purple} />
@@ -1001,11 +1130,13 @@ export default function Insights() {
               </>
             ) : (
               <>
+                <SortBtn col="Actual_Sales_Qty"                    label="Actual"            sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
                 <SortBtn col="My_Model_Forecast_Qty"               label="My Model"          sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
                 <SortBtn col="Approved_Consensus_Forecast_Qty"     label="Approved Consensus" sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
                 <SortBtn col="Best_Fit_With_MI_Forecast_Qty"       label="Best Fit MI"        sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
                 <SortBtn col="Consensus_Forecast_Qty"              label="Consensus"          sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
                 <SortBtn col="Final_Forecast_Qty"                  label="Final"              sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
+                <SortBtn col="Three_MA_Deviation_Forecast_Qty"     label="3MA Deviation"      sortCol={sortForecast} setSortCol={setSortForecast} accent={T.teal} />
               </>
             )}
             <span style={{ background: tabAccent + "14",
@@ -1040,31 +1171,40 @@ export default function Insights() {
                       {Array.from({ length: 4 }).map((_, i) => (
                         <th key={i} style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
                       ))}
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>Budgeted unit</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>Primary / planning</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Secondary / RD</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Cur month plan</th>
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Qty × price</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Qty × budget price</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Actual secondary</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Qty × RD price</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>Actual / Budget</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>M+1 from history</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>Qty × RD price</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>Forecast / Budget</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Full FY plan</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>FY to date</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>FYTD × RD price</th>
                       <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>FYTD / Annual · left</th>
                     </tr>
                   </thead>
                   <tbody>
                     {budgetPaged.map((r, idx) => {
-                      const rowNum  = agency ? idx + 1 : (budgetPage - 1) * PAGE_SIZE + idx + 1;
-                      const bg      = idx % 2 === 0 ? T.card : T.surface + "66";
-                      const budget  = toNumber(r.Budget_Qty);
-                      const price   = toNumber(r.Budget_Price);
-                      const bValue  = toNumber(r.Budget_Value);
-                      const annual  = toNumber(r.Annual_Budget_Qty);
-                      const ach     = r["Achievement_%"];
-                      const poss    = r["Possible_Achievement_%"];
-                      const reach   = r["Annual_Reach_%"];
-                      const left    = toNumber(r.Annual_Remaining_Qty);
-                      const fcst    = r.Current_Month_Forecast;
+                      const rowNum      = agency ? idx + 1 : (budgetPage - 1) * PAGE_SIZE + idx + 1;
+                      const bg          = idx % 2 === 0 ? T.card : T.surface + "66";
+                      const budget      = toNumber(r.Budget_Qty);
+                      const budgetPrice = toNumber(r.Budget_Price);
+                      const rdPrice     = r.Distributor_Unit_Price;
+                      const priceFallback = r.Price_Source === "BUDGET_FALLBACK";
+                      const bValue      = toNumber(r.Budget_Value);
+                      const salesValue  = toNumber(r.Current_Month_Sales_Value);
+                      const fcstValue   = toNumber(r.Current_Month_Forecast_Value);
+                      const fytdValue   = toNumber(r.FYTD_Sales_Value);
+                      const annual      = toNumber(r.Annual_Budget_Qty);
+                      const ach         = r["Achievement_%"];
+                      const poss        = r["Possible_Achievement_%"];
+                      const reach       = r["Annual_Reach_%"];
+                      const left        = toNumber(r.Annual_Remaining_Qty);
+                      const fcst        = r.Current_Month_Forecast;
                       return (
                         <tr key={`${r.ItemCode}-${rowNum}`} className="ins-row"
                           onMouseEnter={e => e.currentTarget.style.background = T.purple + "0D"}
@@ -1074,7 +1214,14 @@ export default function Insights() {
                           <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
                           <td style={{ ...tdBase, background: bg, color: T.text, minWidth: 200, fontFamily: FONT_UI, fontWeight: 500 }}>{r.ItemName || "—"}</td>
                           <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right" }}>
-                            {price > 0 ? formatNum(price, 2) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                            {budgetPrice > 0 ? formatNum(budgetPrice, 2) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                          </td>
+                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>
+                            {rdPrice != null
+                              ? <span style={{ color: T.sky, fontWeight: 700 }}>{formatNum(rdPrice, 2)}</span>
+                              : priceFallback
+                              ? <span style={{ color: T.muted, fontWeight: 400 }} title="No distributor price on file — using budget price">≈ {formatNum(budgetPrice, 2)}</span>
+                              : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
                           </td>
                           <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, textAlign: "right" }}>
                             {budget > 0 ? formatNum(budget) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
@@ -1085,6 +1232,9 @@ export default function Insights() {
                           <td style={{ ...tdBase, background: bg, color: T.sky, fontWeight: 800, textAlign: "right" }}>
                             {formatNum(r.Current_Month_Sales)}
                           </td>
+                          <td style={{ ...tdBase, background: bg, color: T.sky, textAlign: "right" }}>
+                            {salesValue > 0 ? formatNum(salesValue) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                          </td>
                           <td style={{ ...tdBase, background: bg, minWidth: 150, verticalAlign: "middle" }}>
                             <BudgetBar reach={ach} label="Actual / Budget" />
                           </td>
@@ -1092,6 +1242,9 @@ export default function Insights() {
                             {fcst != null && toNumber(fcst) > 0
                               ? formatNum(fcst)
                               : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
+                          </td>
+                          <td style={{ ...tdBase, background: bg, color: T.amber, textAlign: "right" }}>
+                            {fcstValue > 0 ? formatNum(fcstValue) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
                           </td>
                           <td style={{ ...tdBase, background: bg, minWidth: 150, verticalAlign: "middle" }}>
                             <BudgetBar reach={poss} label="Forecast / Budget" />
@@ -1101,6 +1254,9 @@ export default function Insights() {
                           </td>
                           <td style={{ ...tdBase, background: bg, color: T.sky, textAlign: "right" }}>
                             {formatNum(r.FYTD_Sales_Qty)}
+                          </td>
+                          <td style={{ ...tdBase, background: bg, color: T.sky, textAlign: "right" }}>
+                            {fytdValue > 0 ? formatNum(fytdValue) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
                           </td>
                           <td style={{ ...tdBase, background: bg, minWidth: 170, verticalAlign: "middle" }}>
                             <BudgetBar reach={reach} label="FYTD / Annual" />
@@ -1163,13 +1319,21 @@ export default function Insights() {
                       const momNull = momRaw == null;
                       const growth  = momNull ? 0 : toNumber(momRaw);
                       const bg      = idx % 2 === 0 ? T.card : T.surface + "66";
+                      const notBudgeted = r.Is_In_Master === false;
                       return (
                         <tr key={`${r.ItemCode}-${rowNum}`} className="ins-row"
                           onMouseEnter={e => e.currentTarget.style.background = T.blue + "0D"}
                           onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                           <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right", minWidth: 36 }}>{rowNum}</td>
                           <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, fontFamily: FONT_UI }}>{r.Agency || "—"}</td>
-                          <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>
+                            {r.ItemCode}
+                            {notBudgeted && (
+                              <div style={{ marginTop: 3 }}>
+                                <InfoTag text="No budget" color={T.amber} />
+                              </div>
+                            )}
+                          </td>
                           <td style={{ ...tdBase, background: bg, color: T.text, minWidth: 200, fontFamily: FONT_UI, fontWeight: 500 }}>{r.ItemName || "—"}</td>
                           <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{formatNum(r.Last_Month_Sales)}</td>
                           <td style={{ ...tdBase, background: bg, color: T.sky, fontWeight: 800, textAlign: "right" }}>{formatNum(r.Current_Month_Sales)}</td>
@@ -1315,11 +1479,12 @@ export default function Insights() {
 
         ) : (
 
-          /* ── FORECAST TABLE (model vs third-party, budgeted SKUs only) ──
+          /* ── FORECAST TABLE (model vs third-party vs ACTUAL, budgeted
+             SKUs only, for the currently displayed CLOSED month) ──
              Table only — no KPI cards for this tab. */
           forecastTableRows.length === 0 ? (
             <EmptyState glyph="◔" title="No forecast comparison records found"
-              hint="Run the engine, and confirm Forecast.xlsx has rows for the current forecast month." />
+              hint="Run the engine, and confirm Forecast.xlsx has rows for the current closed month." />
           ) : (
             <>
               <div className="ins-scroll" style={{ overflowX: "auto", borderRadius: 12, border: `1px solid ${T.border}` }}>
@@ -1331,20 +1496,19 @@ export default function Insights() {
                       {Array.from({ length: 5 }).map((_, i) => (
                         <th key={i} style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
                       ))}
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.teal }}>Our model</th>
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
-                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.sky }}>What happened</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.teal }}>Our model + acc</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party + acc</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party + acc</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party + acc</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party + acc</th>
+                      <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.muted }}>3rd party + acc</th>
                     </tr>
                   </thead>
                   <tbody>
                     {forecastPaged.map((r, idx) => {
                       const rowNum = agency ? idx + 1 : (forecastPage - 1) * PAGE_SIZE + idx + 1;
                       const bg     = idx % 2 === 0 ? T.card : T.surface + "66";
-                      const cell = (v) => v != null
-                        ? formatNum(v)
-                        : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>;
                       return (
                         <tr key={`${r.ItemCode}-${rowNum}`} className="ins-row"
                           onMouseEnter={e => e.currentTarget.style.background = T.teal + "0D"}
@@ -1353,14 +1517,16 @@ export default function Insights() {
                           <td style={{ ...tdBase, background: bg, color: T.purple, fontWeight: 800, fontFamily: FONT_UI }}>{r.Agency || "—"}</td>
                           <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}>{r.ItemCode}</td>
                           <td style={{ ...tdBase, background: bg, color: T.text, minWidth: 200, fontFamily: FONT_UI, fontWeight: 500 }}>{r.ItemName || "—"}</td>
-                          <td style={{ ...tdBase, background: bg, color: T.muted }}>{r.Forecast_Month || "—"}</td>
-                          <td style={{ ...tdBase, background: bg, color: T.teal, fontWeight: 900, textAlign: "right" }}>
-                            {cell(r.My_Model_Forecast_Qty)}
+                          <td style={{ ...tdBase, background: bg, color: T.muted }}>{r.Comparison_Month || "—"}</td>
+                          <td style={{ ...tdBase, background: bg, color: T.sky, fontWeight: 900, textAlign: "right" }}>
+                            {r.Actual_Sales_Qty != null ? formatNum(r.Actual_Sales_Qty) : <span style={{ color: T.muted, fontWeight: 400 }}>—</span>}
                           </td>
-                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Approved_Consensus_Forecast_Qty)}</td>
-                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Best_Fit_With_MI_Forecast_Qty)}</td>
-                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Consensus_Forecast_Qty)}</td>
-                          <td style={{ ...tdBase, background: bg, textAlign: "right" }}>{cell(r.Final_Forecast_Qty)}</td>
+                          <ForecastQtyCell qty={r.My_Model_Forecast_Qty} accuracy={r["My_Model_Accuracy_%"]} bg={bg} emphasize />
+                          <ForecastQtyCell qty={r.Approved_Consensus_Forecast_Qty} accuracy={r["Approved_Consensus_Accuracy_%"]} bg={bg} />
+                          <ForecastQtyCell qty={r.Best_Fit_With_MI_Forecast_Qty} accuracy={r["Best_Fit_With_MI_Accuracy_%"]} bg={bg} />
+                          <ForecastQtyCell qty={r.Consensus_Forecast_Qty} accuracy={r["Consensus_Accuracy_%"]} bg={bg} />
+                          <ForecastQtyCell qty={r.Final_Forecast_Qty} accuracy={r["Final_Accuracy_%"]} bg={bg} />
+                          <ForecastQtyCell qty={r.Three_MA_Deviation_Forecast_Qty} accuracy={r["Three_MA_Deviation_Accuracy_%"]} bg={bg} />
                         </tr>
                       );
                     })}
