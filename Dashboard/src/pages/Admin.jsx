@@ -8,9 +8,9 @@ const API_BASE = "/api/forecast";
 
 const FONT_UI   = "'Inter', 'IBM Plex Sans', sans-serif";
 const FONT_MONO = "'JetBrains Mono', monospace";
-const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.05)";
-const SHADOW_MD = "0 1px 3px rgba(16,24,40,0.06), 0 12px 28px -16px rgba(16,24,40,0.18)";
-const SHADOW_LG = "0 2px 6px rgba(16,24,40,0.06), 0 24px 48px -24px rgba(16,24,40,0.22)";
+const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.04), 0 6px 18px -12px rgba(16,24,40,0.10)";
+const SHADOW_MD = "0 2px 4px rgba(16,24,40,0.05), 0 16px 40px -20px rgba(16,24,40,0.22)";
+const SHADOW_LG = "0 4px 10px rgba(16,24,40,0.06), 0 34px 68px -30px rgba(16,24,40,0.30)";
 
 function pretty(obj) {
   try { return JSON.stringify(obj, null, 2); } catch { return String(obj); }
@@ -35,6 +35,44 @@ const GlobalStyle = () => (
     .health-strip{display:flex;gap:10px;flex-wrap:wrap}
     @media(max-width:1000px){.admin-grid{grid-template-columns:1fr!important}}
     @media(max-width:600px){.health-strip>*{min-width:120px}}
+
+    /* ═══ v5 visual refresh — pure CSS, no logic ═══ */
+    .page-shell { position: relative; }
+    .page-shell::before {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background-image: radial-gradient(${T.muted}30 1px, transparent 1px);
+      background-size: 24px 24px;
+      -webkit-mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+              mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+    }
+    .page-shell::after {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(760px 380px at 108% 8%, ${T.teal}12, transparent 65%),
+        radial-gradient(640px 340px at -8% 88%, ${T.purple}0E, transparent 60%);
+      animation: aurora-drift 18s ease-in-out infinite alternate;
+    }
+    .page-shell > * { position: relative; z-index: 1; }
+    @keyframes aurora-drift {
+      from { opacity: 0.6; transform: translate3d(0,-10px,0); }
+      to   { opacity: 1;   transform: translate3d(0,12px,0); }
+    }
+    @keyframes hero-float {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50%      { transform: translateY(-4px) rotate(-3deg); }
+    }
+    .hero-icon { animation: hero-float 5.5s ease-in-out infinite; }
+    .ui-card { border-radius: 18px !important; }
+    .ui-card:hover {
+      transform: translateY(-3px);
+      border-color: ${T.teal}55 !important;
+      box-shadow: 0 2px 8px rgba(16,24,40,0.06), 0 30px 60px -26px ${T.teal}4D !important;
+    }
+    .ui-btn { border-radius: 11px !important; }
+    .ui-btn:not(:disabled):hover  { transform: translateY(-1px) scale(1.015); filter: saturate(1.12) brightness(1.03); }
+    .ui-btn:not(:disabled):active { transform: translateY(0) scale(0.985); }
+    input::placeholder { color: ${T.muted}AA; }
+    ::selection { background: ${T.teal}2E; }
   `}</style>
 );
 
@@ -227,7 +265,7 @@ export default function Admin() {
   const handleFutureAction = (label) => { setAlert({ type: "info", msg: `${label} is planned for the next backend phase and is not available yet.` }); appendLog(`${label} ⏳ (planned)`, { message: "Not implemented in backend yet." }); };
 
   return (
-    <div style={{ minHeight: "100vh",
+    <div className="page-shell" style={{ minHeight: "100vh",
       background: `radial-gradient(1100px 500px at 85% -10%, ${T.teal}0E, transparent 60%),
                    radial-gradient(900px 420px at -10% 0%, ${T.purple}0C, transparent 55%),
                    ${T.bg}`,
@@ -242,7 +280,7 @@ export default function Admin() {
         border: `1px solid ${T.border}`, borderRadius: 16,
         boxShadow: SHADOW_MD, padding: "18px 22px", marginBottom: 22 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 15 }}>
-          <div style={{ width: 44, height: 44, background: `linear-gradient(135deg, ${T.purple}, ${T.teal})`, borderRadius: 13, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, color: "#fff", boxShadow: `0 8px 20px -8px ${T.purple}AA` }}>⚙</div>
+          <div className="hero-icon" style={{ width: 44, height: 44, background: `linear-gradient(135deg, ${T.purple}, ${T.teal})`, borderRadius: 13, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, color: "#fff", boxShadow: `0 8px 20px -8px ${T.purple}AA` }}>⚙</div>
           <div>
             <div style={{ fontSize: 9, color: T.purple, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 3 }}>System Admin</div>
             <h1 style={{ margin: 0, fontSize: 21, fontWeight: 900, letterSpacing: -0.5,

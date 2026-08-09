@@ -4,6 +4,8 @@ from flask import Blueprint, request, jsonify
 
 from engines.forecast_orchestrator import (
     get_dashboard,
+    get_agencies,
+    get_agency_dashboard,
     get_skus,
     get_skus_full,
     reload_data_now,
@@ -47,6 +49,36 @@ def dashboard():
 @forecast_bp.route("/skus", methods=["GET"])
 def skus():
     return jsonify({"skus": get_skus()}), 200
+
+
+# ============================================================
+# AGENCY-WISE FORECAST PAGE (business change 4) — the Forecast
+# page selector now lists agencies; KPIs/charts are the same
+# computations aggregated across every SKU of the agency.
+# Item-wise endpoints above are kept for backward compatibility.
+# ============================================================
+@forecast_bp.route("/agencies", methods=["GET"])
+def agencies():
+    return jsonify({"agencies": get_agencies()}), 200
+
+
+@forecast_bp.route("/agency_dashboard", methods=["POST"])
+def agency_dashboard():
+    body = request.get_json(silent=True) or {}
+    agency = body.get("agency")
+
+    if not agency:
+        return jsonify({"success": False, "error": "agency required"}), 400
+
+    try:
+        result = get_agency_dashboard(agency)
+        if result is None:
+            return jsonify({"success": False, "error": "Agency not found"}), 404
+
+        return jsonify({"success": True, "data": result}), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @forecast_bp.route("/reload_data", methods=["POST"])

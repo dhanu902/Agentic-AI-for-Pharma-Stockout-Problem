@@ -1,4 +1,19 @@
 /*Dashoboard -> src -> pages -> Inventory.jsx */
+// v3 — AGENCY-WISE (business change 5): the inventory projection is now
+//      shown per AGENCY instead of per item. The per-item risk logic
+//      (scenarios A/B/C, Risk_Level) is unchanged — the backend sums
+//      quantities across every SKU of the agency and reports the WORST
+//      Risk_Level among its items (GET /api/risk/results_by_agency).
+// v5 — INDEPENDENT FILTERS: the page no longer reads the ?agency= URL param
+//      (shared with the Forecast page). It has its OWN agency and SKU
+//      selectors in the header; DATA COVERAGE badges moved to the bottom.
+// v4 — LAYOUT REWORK (same pattern as the Forecast page): agency-wise
+//      overview first (agency list + aggregated detail, unchanged), then a
+//      SKU-WISE section for the selected agency — its own SKU search bar,
+//      item name + code heading, and the ORIGINAL per-item detail (stock
+//      buckets + scenario A/B/C cards with flags/reasoning). Item rows come
+//      from the item-wise GET /api/risk/results (now enriched with
+//      Agency/ProductName display columns). No risk logic changed.
 // M+1 Inventory page uses physical DB/WH stock only.
 // Pending PO/GRN and Net Demand are shown only in Horizon page.
 // SKU detail header so planners can see how much confirmed incoming
@@ -14,16 +29,15 @@
 // underlying numbers are trivial (e.g. 0 forecast trivially "met").
 
 import React, { useEffect, useMemo, useState } from "react";
-import { useSearchParams } from "react-router-dom";
 import T from "../theme";
 
 const API_BASE = "/api/risk";
 
 const FONT_UI   = "'Inter', 'IBM Plex Sans', sans-serif";
 const FONT_MONO = "'JetBrains Mono', monospace";
-const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.05)";
-const SHADOW_MD = "0 1px 3px rgba(16,24,40,0.06), 0 12px 28px -16px rgba(16,24,40,0.18)";
-const SHADOW_LG = "0 2px 6px rgba(16,24,40,0.06), 0 24px 48px -24px rgba(16,24,40,0.22)";
+const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.04), 0 6px 18px -12px rgba(16,24,40,0.10)";
+const SHADOW_MD = "0 2px 4px rgba(16,24,40,0.05), 0 16px 40px -20px rgba(16,24,40,0.22)";
+const SHADOW_LG = "0 4px 10px rgba(16,24,40,0.06), 0 34px 68px -30px rgba(16,24,40,0.30)";
 
 /* ─── Risk config ───────────────────────────────────────────── */
 const RISK_CONFIG = {
@@ -53,7 +67,7 @@ function getRisk(level) {
   return RISK_CONFIG[level] || { color: T.muted, label: level || "Unknown", icon: "?" };
 }
 
-let riskMemory = { sku: "", selected: null, rows: [] };
+let riskMemory = { agency: "", selected: null, rows: [] };
 
 /* ─── Helpers ───────────────────────────────────────────────── */
 function parseJsonArray(value) {
@@ -126,6 +140,44 @@ const GlobalStyle = () => (
       .risk-kpis-wide  { grid-template-columns: 1fr 1fr !important; }
       .risk-stock-kpis { grid-template-columns: 1fr 1fr !important; }
     }
+
+    /* ═══ v5 visual refresh — pure CSS, no logic ═══ */
+    .page-shell { position: relative; }
+    .page-shell::before {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background-image: radial-gradient(${T.muted}30 1px, transparent 1px);
+      background-size: 24px 24px;
+      -webkit-mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+              mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+    }
+    .page-shell::after {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(760px 380px at 108% 8%, ${T.orange}12, transparent 65%),
+        radial-gradient(640px 340px at -8% 88%, ${T.red}0E, transparent 60%);
+      animation: aurora-drift 18s ease-in-out infinite alternate;
+    }
+    .page-shell > * { position: relative; z-index: 1; }
+    @keyframes aurora-drift {
+      from { opacity: 0.6; transform: translate3d(0,-10px,0); }
+      to   { opacity: 1;   transform: translate3d(0,12px,0); }
+    }
+    @keyframes hero-float {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50%      { transform: translateY(-4px) rotate(-3deg); }
+    }
+    .hero-icon { animation: hero-float 5.5s ease-in-out infinite; }
+    .ui-card { border-radius: 18px !important; }
+    .ui-card:hover {
+      transform: translateY(-3px);
+      border-color: ${T.orange}55 !important;
+      box-shadow: 0 2px 8px rgba(16,24,40,0.06), 0 30px 60px -26px ${T.orange}4D !important;
+    }
+    .ui-btn { border-radius: 11px !important; }
+    .ui-btn:not(:disabled):hover  { transform: translateY(-1px) scale(1.015); filter: saturate(1.12) brightness(1.03); }
+    .ui-btn:not(:disabled):active { transform: translateY(0) scale(0.985); }
+    input::placeholder { color: ${T.muted}AA; }
+    ::selection { background: ${T.orange}2E; }
   `}</style>
 );
 
@@ -324,9 +376,7 @@ function SectionToggle({ expanded, onToggle, label, accent }) {
 
 /* ─── Main ──────────────────────────────────────────────────── */
 export default function RiskPage() {
-  const [searchParams] = useSearchParams();
-
-  const [sku, setSku]               = useState(riskMemory.sku || "");
+  const [agency, setAgency]         = useState(riskMemory.agency || "");
   const [rows, setRows]             = useState([]);
   const [loading, setLoading]       = useState(false);
   const [running, setRunning]       = useState(false);
@@ -335,13 +385,21 @@ export default function RiskPage() {
   const [riskFilter, setRiskFilter] = useState("ALL");
   const [detailOpen, setDetailOpen] = useState(false);
 
+  // SKU-wise section state (items WITHIN the selected agency)
+  const [itemRows, setItemRows]         = useState([]);
+  const [skuQuery, setSkuQuery]         = useState("");
+  const [selectedItem, setSelectedItem] = useState(null);
+
+  // CHANGED (agency-wise): rows are agencies; search matches agency name/code
   const filteredRows = useMemo(() => {
     return rows.filter(row => {
-      const matchesSku  = !sku || String(row.ItemCode || "").toLowerCase().includes(sku.toLowerCase());
+      const matchesAgency = !agency ||
+        String(row.Agency || "").toLowerCase().includes(agency.toLowerCase()) ||
+        String(row.AgencyCode || "").toLowerCase().includes(agency.toLowerCase());
       const matchesRisk = riskFilter === "ALL" || row.Risk_Level === riskFilter;
-      return matchesSku && matchesRisk;
+      return matchesAgency && matchesRisk;
     });
-  }, [rows, sku, riskFilter]);
+  }, [rows, agency, riskFilter]);
 
   const summary = useMemo(() => ({
     safe:         rows.filter(r => r.Risk_Level === "SAFE").length,
@@ -374,29 +432,47 @@ export default function RiskPage() {
     }
   };
 
+  // Pick the first item of an agency (used when the agency selection changes)
+  const pickFirstItemOfAgency = (agencyName, items) => {
+    const first = (items || []).find(r => String(r.Agency || "") === String(agencyName || "")) || null;
+    setSelectedItem(first);
+    setSkuQuery(first ? String(first.ItemCode || "") : "");
+  };
+
+  // CHANGED (agency-wise + SKU-wise): fetch the agency aggregate rows AND
+  // the item-wise rows (enriched with Agency/ProductName) in one go.
   const fetchResults = async () => {
     setLoading(true);
     setError("");
     try {
-      const res  = await fetch(`${API_BASE}/results`);
-      const text = await res.text();
-      let result = {};
-      try { result = text ? JSON.parse(text) : {}; } catch { throw new Error("Backend did not return valid JSON for /results"); }
-      if (!res.ok) throw new Error(result.error || "Failed to load risk results");
+      const [agRes, itRes] = await Promise.all([
+        fetch(`${API_BASE}/results_by_agency`),
+        fetch(`${API_BASE}/results`),
+      ]);
 
-      const dataRows    = Array.isArray(result.rows) ? result.rows : [];
+      const agText = await agRes.text();
+      let agResult = {};
+      try { agResult = agText ? JSON.parse(agText) : {}; } catch { throw new Error("Backend did not return valid JSON for /results_by_agency"); }
+      if (!agRes.ok) throw new Error(agResult.error || "Failed to load risk results");
+
+      const itText = await itRes.text();
+      let itResult = {};
+      try { itResult = itText ? JSON.parse(itText) : {}; } catch { itResult = { rows: [] }; }
+      const items = itRes.ok && Array.isArray(itResult.rows) ? itResult.rows : [];
+
+      const dataRows = Array.isArray(agResult.rows) ? agResult.rows : [];
       setRows(dataRows);
+      setItemRows(items);
 
-      const urlSku      = searchParams.get("sku") || "";
-      const currentSku  = urlSku || riskMemory.sku || "";
-      const matchedRow  = currentSku ? dataRows.find(row => String(row.ItemCode) === String(currentSku)) : null;
-      const nextSelected = matchedRow || (dataRows.length > 0 ? dataRows[0] : null);
+      // Independent page state — no URL params shared with other pages.
+      const currentAgency = riskMemory.agency || "";
+      const matchedRow    = currentAgency ? dataRows.find(row => String(row.Agency) === String(currentAgency)) : null;
+      const nextSelected  = matchedRow || (dataRows.length > 0 ? dataRows[0] : null);
 
       setSelected(nextSelected);
-      riskMemory = { sku: currentSku, selected: nextSelected, rows: dataRows };
-
-      if (urlSku && !matchedRow && dataRows.length > 0)
-        setError(`SKU ${urlSku} was not found in risk results. Showing first available result.`);
+      setAgency(nextSelected ? String(nextSelected.Agency || "") : "");
+      riskMemory = { agency: nextSelected ? String(nextSelected.Agency || "") : "", selected: nextSelected, rows: dataRows };
+      pickFirstItemOfAgency(nextSelected?.Agency, items);
     } catch (err) {
       setError(err.message || "Failed to fetch results");
     } finally {
@@ -411,8 +487,47 @@ export default function RiskPage() {
   const scenarioB   = selectedRow ? getScenarioStatus(selectedRow, "B") : null;
   const scenarioC   = selectedRow ? getScenarioStatus(selectedRow, "C") : null;
 
+  /* ── SKU-wise section derived state ── */
+  const agencyItems = useMemo(() => {
+    const ag = selectedRow?.Agency;
+    if (!ag) return [];
+    return itemRows.filter(r => String(r.Agency || "") === String(ag));
+  }, [itemRows, selectedRow]);
+
+  const loadSku = (codeArg) => {
+    const code = String(codeArg ?? skuQuery).trim();
+    if (!code) return;
+    const found = agencyItems.find(r => String(r.ItemCode) === code);
+    if (found) { setSelectedItem(found); setSkuQuery(code); }
+  };
+
+  /* ── Page-level filters (independent of any other page) ── */
+  const agencyNames = useMemo(
+    () => [...new Set(rows.map(r => String(r.Agency || "")))].filter(Boolean).sort(),
+    [rows]
+  );
+
+  const selectAgencyByName = (nameArg) => {
+    const name = String(nameArg ?? agency).trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    const row =
+      rows.find(r => String(r.Agency || "").toLowerCase() === key) ||
+      rows.find(r => String(r.Agency || "").toLowerCase().includes(key)) ||
+      rows.find(r => String(r.AgencyCode || "").toLowerCase() === key);
+    if (!row) return;
+    setSelected(row);
+    setAgency(String(row.Agency || ""));
+    riskMemory = { ...riskMemory, agency: String(row.Agency || ""), selected: row };
+    pickFirstItemOfAgency(row.Agency, itemRows);
+  };
+
+  const itemScenarioA = selectedItem ? getScenarioStatus(selectedItem, "A") : null;
+  const itemScenarioB = selectedItem ? getScenarioStatus(selectedItem, "B") : null;
+  const itemScenarioC = selectedItem ? getScenarioStatus(selectedItem, "C") : null;
+
   return (
-    <div style={{ minHeight: "100vh",
+    <div className="page-shell" style={{ minHeight: "100vh",
       background: `radial-gradient(1100px 500px at 85% -10%, ${T.orange}0E, transparent 60%),
                    radial-gradient(900px 420px at -10% 0%, ${T.red}0A, transparent 55%),
                    ${T.bg}`,
@@ -427,7 +542,7 @@ export default function RiskPage() {
         border: `1px solid ${T.border}`, borderRadius: 16,
         boxShadow: SHADOW_MD, padding: "18px 22px", marginBottom: 20 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 15 }}>
-          <div style={{ width: 44, height: 44, background: `linear-gradient(135deg, ${T.orange}, ${T.red})`,
+          <div className="hero-icon" style={{ width: 44, height: 44, background: `linear-gradient(135deg, ${T.orange}, ${T.red})`,
             borderRadius: 13, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20, color: "#fff",
             boxShadow: `0 8px 20px -8px ${T.orange}AA` }}>⚡</div>
           <div>
@@ -441,14 +556,45 @@ export default function RiskPage() {
             </h1>
           </div>
         </div>
-        <button className="ui-btn" onClick={runRiskEngine} disabled={running} style={{
-          background: running ? T.subtle : `linear-gradient(135deg, ${T.orange}, ${T.red})`, border: "none",
-          color: running ? T.muted : "#fff", fontWeight: 800, fontSize: 13, borderRadius: 10,
-          padding: "11px 20px", cursor: running ? "not-allowed" : "pointer",
-          fontFamily: FONT_UI, boxShadow: running ? "none" : `0 8px 18px -8px ${T.orange}AA`,
-          display: "inline-flex", alignItems: "center", gap: 8 }}>
-          {running ? <><span className="ui-spinner" /> Running…</> : <>▶ Run Risk Engine</>}
-        </button>
+        {/* ── Page-level filters — the Inventory page has its OWN agency
+             and SKU selectors now (independent of the Forecast page) ── */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 10, boxShadow: SHADOW_SM, padding: "9px 14px", gap: 8, width: 230 }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={T.muted} strokeWidth="2.5"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
+            <input list="risk-agency-options" value={agency}
+              onChange={e => { const v = e.target.value; setAgency(v); riskMemory = { ...riskMemory, agency: v }; }}
+              onKeyDown={e => e.key === "Enter" && selectAgencyByName(agency)}
+              placeholder={loading ? "Loading agencies..." : "Agency…"}
+              style={{ background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 12.5, width: "100%", fontFamily: FONT_MONO }} />
+            <datalist id="risk-agency-options">{agencyNames.map(a => <option key={a} value={a} />)}</datalist>
+          </div>
+          <button className="ui-btn" onClick={() => selectAgencyByName(agency)}
+            style={{ background: `linear-gradient(135deg, ${T.orange}, ${T.orange}D9)`, border: "none", color: "#fff", fontWeight: 800, fontSize: 12, borderRadius: 10, padding: "10px 16px", cursor: "pointer", fontFamily: FONT_UI }}>
+            Load Agency
+          </button>
+          <div style={{ display: "flex", alignItems: "center", background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 10, boxShadow: SHADOW_SM, padding: "9px 14px", gap: 8, width: 210 }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={T.muted} strokeWidth="2.5"><circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" /></svg>
+            <input list="risk-sku-options" value={skuQuery} onChange={e => setSkuQuery(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && loadSku(skuQuery)}
+              placeholder="SKU within agency…"
+              style={{ background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 12.5, width: "100%", fontFamily: FONT_MONO }} />
+            <datalist id="risk-sku-options">
+              {agencyItems.map(r => <option key={r.ItemCode} value={r.ItemCode}>{r.ProductName || ""}</option>)}
+            </datalist>
+          </div>
+          <button className="ui-btn" onClick={() => loadSku(skuQuery)}
+            style={{ background: `linear-gradient(135deg, ${T.red}, ${T.red}D9)`, border: "none", color: "#fff", fontWeight: 800, fontSize: 12, borderRadius: 10, padding: "10px 16px", cursor: "pointer", fontFamily: FONT_UI }}>
+            Load SKU
+          </button>
+          <button className="ui-btn" onClick={runRiskEngine} disabled={running} style={{
+            background: running ? T.subtle : `linear-gradient(135deg, ${T.orange}, ${T.red})`, border: "none",
+            color: running ? T.muted : "#fff", fontWeight: 800, fontSize: 13, borderRadius: 10,
+            padding: "11px 20px", cursor: running ? "not-allowed" : "pointer",
+            fontFamily: FONT_UI, boxShadow: running ? "none" : `0 8px 18px -8px ${T.orange}AA`,
+            display: "inline-flex", alignItems: "center", gap: 8 }}>
+            {running ? <><span className="ui-spinner" /> Running…</> : <>▶ Run Risk Engine</>}
+          </button>
+        </div>
       </div>
 
       {/* ── Error ── */}
@@ -468,25 +614,7 @@ export default function RiskPage() {
           { label: "WH Inspection", count: summary.whInspection, color: T.red,     key: "WH_INSPECTION_REQUIRED" },
           { label: "WH Blocked",    count: summary.whBlocked,    color: T.crimson, key: "WH_BLOCKED_REQUIRED" },
           { label: "Critical",      count: summary.critical,     color: T.red,     key: "CRITICAL_STOCKOUT" },
-          { label: "Total SKUs",    count: rows.length,          color: T.blue,    key: "ALL" },
-        ].map(({ label, count, color, key }) => (
-          <SummaryBadge key={key} label={label} count={count} color={color}
-            active={riskFilter === key}
-            onClick={() => setRiskFilter(prev => prev === key ? "ALL" : key)} />
-        ))}
-      </div>
-
-      {/* ── Summary badges: data-completeness gaps (not a risk verdict) ── */}
-      <div style={{ display: "flex", gap: 8, marginBottom: 18, flexWrap: "wrap", alignItems: "center" }}>
-        <span style={{ fontSize: 9.5, color: T.muted, textTransform: "uppercase",
-          letterSpacing: 1.4, fontWeight: 800, marginRight: 2 }}>
-          Data Coverage
-        </span>
-        {[
-          { label: "No Forecast",  count: summary.noForecast,  color: T.blue,  key: "NO_FORECAST_DATA" },
-          { label: "No Inventory", count: summary.noInventory, color: T.blue,  key: "NO_INVENTORY_DATA" },
-          { label: "No Data",      count: summary.noData,      color: T.muted, key: "NO_DATA" },
-          { label: "Not Tracked",  count: summary.notTracked,  color: T.muted, key: "NOT_TRACKED" },
+          { label: "Total Agencies", count: rows.length,         color: T.blue,    key: "ALL" },
         ].map(({ label, count, color, key }) => (
           <SummaryBadge key={key} label={label} count={count} color={color}
             active={riskFilter === key}
@@ -502,9 +630,9 @@ export default function RiskPage() {
       ── */}
       <div className="risk-kpis">
         <KpiCard
-          title="Selected SKU"
-          value={selectedRow?.ItemCode || "—"}
-          subtitle="Focused item"
+          title="Selected Agency"
+          value={selectedRow?.Agency || "—"}
+          subtitle={selectedRow?.SKU_Count != null ? `${formatNum(selectedRow.SKU_Count)} SKUs tracked` : "Focused agency"}
           accent={T.blue}
         />
         <KpiCard
@@ -532,7 +660,7 @@ export default function RiskPage() {
         expanded={detailOpen}
         onToggle={() => setDetailOpen(o => !o)}
         accent={T.orange}
-        label={{ show: "Show SKU Details & Scenario Analysis", hide: "Hide SKU Details & Scenario Analysis" }}
+        label={{ show: "Show Agency Details & Scenario Analysis", hide: "Hide Agency Details & Scenario Analysis" }}
       />
 
       {/* ══ COLLAPSIBLE ═══════════════════════════════════════ */}
@@ -543,22 +671,13 @@ export default function RiskPage() {
           {/* Left: SKU list */}
           <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, overflow: "hidden", boxShadow: SHADOW_MD }}>
             <div style={{ padding: "16px 18px", borderBottom: `1px solid ${T.border}` }}>
-              <div style={{ fontSize: 12, fontWeight: 900, color: T.text, marginBottom: 2 }}>Risk Results</div>
-              <div style={{ fontSize: 10, color: T.muted }}>Select a SKU to inspect scenario details</div>
+              <div style={{ fontSize: 12, fontWeight: 900, color: T.text, marginBottom: 2 }}>Risk Results — Agency Wise</div>
+              <div style={{ fontSize: 10, color: T.muted }}>Select an agency to inspect aggregated scenario details</div>
             </div>
 
             <div style={{ padding: "12px 14px", borderBottom: `1px solid ${T.border}`, display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ display: "flex", alignItems: "center", background: T.surface,
-                border: `1px solid ${T.borderHi}`, borderRadius: 10, padding: "8px 12px", gap: 8 }}>
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={T.muted} strokeWidth="2.5">
-                  <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
-                </svg>
-                <input type="text" placeholder="Search ItemCode…" value={sku}
-                  onChange={e => { const v = e.target.value; setSku(v); riskMemory = { ...riskMemory, sku: v }; }}
-                  style={{ background: "transparent", border: "none", outline: "none",
-                    color: T.text, fontSize: 12, width: "100%", fontFamily: FONT_MONO }} />
-              </div>
-
+              {/* Agency text filter moved to the page header — this panel
+                  keeps only the risk-level filter. */}
               <select value={riskFilter} onChange={e => setRiskFilter(e.target.value)}
                 style={{ background: T.surface, color: T.text, border: `1px solid ${T.borderHi}`,
                   borderRadius: 10, padding: "8px 12px", outline: "none", fontSize: 12,
@@ -584,11 +703,12 @@ export default function RiskPage() {
                 <div style={{ padding: 18, color: T.muted, fontSize: 12 }}>No risk results found.</div>
               ) : (
                 filteredRows.map((row, index) => {
-                  const isActive = String(selectedRow?.ItemCode) === String(row.ItemCode);
+                  const isActive = String(selectedRow?.Agency) === String(row.Agency);
                   return (
-                    <div key={`${row.ItemCode}-${index}`}
-                      onClick={() => { setSelected(row); setSku(String(row.ItemCode || ""));
-                        riskMemory = { ...riskMemory, sku: String(row.ItemCode || ""), selected: row }; }}
+                    <div key={`${row.Agency}-${index}`}
+                      onClick={() => { setSelected(row); setAgency(String(row.Agency || ""));
+                        riskMemory = { ...riskMemory, agency: String(row.Agency || ""), selected: row };
+                        pickFirstItemOfAgency(row.Agency, itemRows); }}
                       style={{ padding: "14px 16px", borderBottom: `1px solid ${T.border}`, cursor: "pointer",
                         background: isActive ? T.blue + "14" : "transparent",
                         borderLeft: isActive ? `3px solid ${T.blue}` : "3px solid transparent",
@@ -596,25 +716,25 @@ export default function RiskPage() {
                       onMouseEnter={e => { if (!isActive) e.currentTarget.style.background = T.surface; }}
                       onMouseLeave={e => { if (!isActive) e.currentTarget.style.background = "transparent"; }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
-                        <span style={{ fontWeight: 900, fontSize: 13, color: T.text, fontFamily: FONT_MONO }}>{row.ItemCode}</span>
+                        <span style={{ fontWeight: 900, fontSize: 13, color: T.text, fontFamily: FONT_MONO }}>{row.Agency}</span>
                         <RiskBadge level={row.Risk_Level} />
                       </div>
-                      {(row.Is_Synthetic_Code === 1 || row.Has_Inventory_Data === 0 || row.Has_Forecast_Data === 0) && (
+                      {(toNumber(row.Synthetic_Item_Count) > 0 || toNumber(row.No_Inventory_Item_Count) > 0 || toNumber(row.No_Forecast_Item_Count) > 0) && (
                         <div style={{ display: "flex", gap: 5, marginBottom: 8, flexWrap: "wrap" }}>
-                          {row.Is_Synthetic_Code === 1 && (
+                          {toNumber(row.Synthetic_Item_Count) > 0 && (
                             <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
                               background: T.muted + "14", border: `1px solid ${T.muted}33`, color: T.muted,
-                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Physical Code</span>
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>{formatNum(row.Synthetic_Item_Count)} No Physical Code</span>
                           )}
-                          {row.Is_Synthetic_Code !== 1 && row.Has_Inventory_Data === 0 && (
+                          {toNumber(row.No_Inventory_Item_Count) > 0 && (
                             <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
                               background: T.blue + "14", border: `1px solid ${T.blue}33`, color: T.blue,
-                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Inventory Data</span>
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>{formatNum(row.No_Inventory_Item_Count)} No Inventory</span>
                           )}
-                          {row.Has_Forecast_Data === 0 && (
+                          {toNumber(row.No_Forecast_Item_Count) > 0 && (
                             <span style={{ fontSize: 8.5, fontWeight: 800, padding: "1px 7px", borderRadius: 999,
                               background: T.blue + "14", border: `1px solid ${T.blue}33`, color: T.blue,
-                              textTransform: "uppercase", letterSpacing: 0.6 }}>No Forecast Data</span>
+                              textTransform: "uppercase", letterSpacing: 0.6 }}>{formatNum(row.No_Forecast_Item_Count)} No Forecast</span>
                           )}
                         </div>
                       )}
@@ -627,6 +747,10 @@ export default function RiskPage() {
                           <div style={{ fontSize: 9, color: T.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 2 }}>A Unmet</div>
                           <div style={{ fontSize: 12, fontWeight: 700, fontFamily: FONT_MONO,
                             color: toNumber(row.A_unmet) > 0 ? T.red : T.green }}>{formatNum(row.A_unmet)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 9, color: T.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 2 }}>SKUs</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, fontFamily: FONT_MONO }}>{formatNum(row.SKU_Count)}</div>
                         </div>
                         <div style={{ marginLeft: "auto" }}>
                           <div style={{ fontSize: 9, color: T.muted, textTransform: "uppercase", letterSpacing: 1, marginBottom: 2 }}>Base / Forecast</div>
@@ -647,7 +771,7 @@ export default function RiskPage() {
                 color: T.muted, fontSize: 13, display: "flex", flexDirection: "column",
                 alignItems: "center", justifyContent: "center", minHeight: 200, gap: 10, boxShadow: SHADOW_SM }}>
                 <div style={{ width: 64, height: 64, borderRadius: 18, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 26, color: T.orange, background: `linear-gradient(135deg, ${T.orange}14, ${T.red}0D)`, border: `1px solid ${T.orange}22` }}>⚡</div>
-                <div>Select a SKU from the list to inspect scenario details.</div>
+                <div>Select an agency from the list to inspect aggregated scenario details.</div>
               </div>
             ) : (
               <>
@@ -656,28 +780,30 @@ export default function RiskPage() {
                   <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${T.orange}, ${T.orange}22 60%, transparent)` }} />
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap", marginBottom: 16 }}>
                     <div>
-                      <div style={{ fontSize: 9, color: T.orange, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 4 }}>SKU Detail</div>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: T.text, fontFamily: FONT_MONO }}>{selectedRow.ItemCode}</div>
+                      <div style={{ fontSize: 9, color: T.orange, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 4 }}>Agency Detail</div>
+                      <div style={{ fontSize: 22, fontWeight: 900, color: T.text, fontFamily: FONT_MONO }}>
+                        {selectedRow.Agency}
+                        {selectedRow.AgencyCode ? <span style={{ fontSize: 12, color: T.muted, marginLeft: 8 }}>({selectedRow.AgencyCode})</span> : null}
+                      </div>
                       <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>
                         Base Month: <span style={{ color: T.text }}>{selectedRow.Base_Month || "—"}</span>
                         {" · "}
                         Forecast Month: <span style={{ color: T.text }}>{selectedRow.Forecast_Month || "—"}</span>
+                        {" · "}
+                        SKUs: <span style={{ color: T.text }}>{formatNum(selectedRow.SKU_Count)}</span>
                       </div>
                     </div>
                     <RiskBadge level={selectedRow.Risk_Level} />
                   </div>
 
-                  {(selectedRow.Is_Synthetic_Code === 1 || selectedRow.Has_Inventory_Data === 0 || selectedRow.Has_Forecast_Data === 0) && (
+                  {(toNumber(selectedRow.Synthetic_Item_Count) > 0 || toNumber(selectedRow.No_Inventory_Item_Count) > 0 || toNumber(selectedRow.No_Forecast_Item_Count) > 0) && (
                     <div style={{ marginBottom: 16, padding: "9px 13px", borderRadius: 10,
                       background: T.blue + "0D", border: `1px solid ${T.blue}2E`, color: T.blue,
                       fontSize: 11, fontWeight: 600, lineHeight: 1.5 }}>
-                      {selectedRow.Is_Synthetic_Code === 1
-                        ? "This SKU has no real ItemCode yet (budget placeholder) — physical stock can't be tracked, so no risk assessment applies."
-                        : selectedRow.Has_Inventory_Data === 0 && selectedRow.Has_Forecast_Data === 0
-                        ? "No inventory record and no forecast found for this SKU this month — nothing to assess yet."
-                        : selectedRow.Has_Inventory_Data === 0
-                        ? "No inventory record found for this SKU this month. Stock buckets below are shown as zero, but this may reflect a data gap rather than confirmed zero stock."
-                        : "No forecast found for this SKU this month — scenario results below assume zero demand."}
+                      Data coverage in this agency:{" "}
+                      {toNumber(selectedRow.Synthetic_Item_Count) > 0 && `${formatNum(selectedRow.Synthetic_Item_Count)} item(s) with no physical code (budget placeholder — stock can't be tracked). `}
+                      {toNumber(selectedRow.No_Inventory_Item_Count) > 0 && `${formatNum(selectedRow.No_Inventory_Item_Count)} item(s) with no inventory record this month (buckets counted as zero — may be a data gap). `}
+                      {toNumber(selectedRow.No_Forecast_Item_Count) > 0 && `${formatNum(selectedRow.No_Forecast_Item_Count)} item(s) with no forecast this month (counted as zero demand).`}
                     </div>
                   )}
 
@@ -691,7 +817,7 @@ export default function RiskPage() {
                   </div>
                 </div>
 
-                <Divider label="Stock Buckets" />
+                <Divider label="Stock Buckets — Agency Total" />
                 <div className="risk-stock-kpis">
                   <KpiCard title="DB No-Risk"      value={formatNum(selectedRow.Distributor_NoRisk_Qty)}   accent={T.green} />
                   <KpiCard title="DB Short Exp"    value={formatNum(selectedRow.Distributor_ShortExp_Qty)} accent={T.amber} />
@@ -705,11 +831,11 @@ export default function RiskPage() {
                   <KpiCard title="WH Expired"      value={formatNum(selectedRow.Primary_Expired_Qty)}      accent={T.red} />
                 </div>
 
-                <Divider label="Scenario Analysis" />
+                <Divider label="Scenario Analysis — Agency Aggregate" />
                 {isDataGap(selectedRow.Risk_Level) ? (
                   <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16,
                     padding: "26px 20px", color: T.muted, fontSize: 12, textAlign: "center", boxShadow: SHADOW_SM }}>
-                    Scenario analysis isn't meaningful for this SKU yet — {riskLabel(selectedRow.Risk_Level).toLowerCase()}.
+                    Scenario analysis isn't meaningful for this agency yet — {riskLabel(selectedRow.Risk_Level).toLowerCase()}.
                   </div>
                 ) : (
                   <div className="risk-scenarios">
@@ -730,6 +856,138 @@ export default function RiskPage() {
             )}
           </div>
         </div>
+      </div>
+
+      {/* ══ SKU-WISE SECTION — items within the selected agency ══
+           Same pattern as the Forecast page: agency overview above,
+           per-SKU detail below. This is the ORIGINAL item-wise view
+           (stock buckets + scenario A/B/C with flags/reasoning) —
+           no logic changed, just scoped to the selected agency. ══ */}
+      {selectedRow && (
+        <>
+          <Divider label={`SKU Detail — ${selectedRow.Agency}`} />
+
+          {/* Subheading — item name + code (SKU filter lives in the page header) */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 9, color: T.blue, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 3 }}>SKU Detail — {selectedRow.Agency}</div>
+              <div style={{ fontSize: 16, fontWeight: 900, color: T.text }}>
+                {selectedItem ? (selectedItem.ProductName || `SKU ${selectedItem.ItemCode}`) : "Select a SKU"}
+              </div>
+              <div style={{ fontSize: 10.5, color: T.muted, marginTop: 2, fontFamily: FONT_MONO }}>
+                {selectedItem ? selectedItem.ItemCode : "—"}
+                {agencyItems.length > 0 && <span>  ·  {agencyItems.length} SKUs in agency</span>}
+              </div>
+            </div>
+          </div>
+
+          {!selectedItem ? (
+            <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: 26,
+              color: T.muted, fontSize: 12.5, textAlign: "center", boxShadow: SHADOW_SM }}>
+              No risk rows found for this agency's SKUs yet. Run the risk engine first.
+            </div>
+          ) : (
+            <>
+              {/* SKU header — original item-wise detail */}
+              <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: "18px 20px", marginBottom: 14, boxShadow: SHADOW_MD, position: "relative", overflow: "hidden" }}>
+                <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${T.orange}, ${T.orange}22 60%, transparent)` }} />
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 16, flexWrap: "wrap", marginBottom: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 9, color: T.orange, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 4 }}>SKU Detail</div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: T.text, fontFamily: FONT_MONO }}>
+                      {selectedItem.ItemCode}
+                      {selectedItem.ProductName && <span style={{ fontSize: 12, color: T.muted, marginLeft: 10, fontFamily: FONT_UI, fontWeight: 600 }}>{selectedItem.ProductName}</span>}
+                    </div>
+                    <div style={{ fontSize: 10, color: T.muted, marginTop: 4 }}>
+                      Base Month: <span style={{ color: T.text }}>{selectedItem.Base_Month || "—"}</span>
+                      {" · "}
+                      Forecast Month: <span style={{ color: T.text }}>{selectedItem.Forecast_Month || "—"}</span>
+                    </div>
+                  </div>
+                  <RiskBadge level={selectedItem.Risk_Level} />
+                </div>
+
+                {(selectedItem.Is_Synthetic_Code === 1 || selectedItem.Has_Inventory_Data === 0 || selectedItem.Has_Forecast_Data === 0) && (
+                  <div style={{ marginBottom: 16, padding: "9px 13px", borderRadius: 10,
+                    background: T.blue + "0D", border: `1px solid ${T.blue}2E`, color: T.blue,
+                    fontSize: 11, fontWeight: 600, lineHeight: 1.5 }}>
+                    {selectedItem.Is_Synthetic_Code === 1
+                      ? "This SKU has no real ItemCode yet (budget placeholder) — physical stock can't be tracked, so no risk assessment applies."
+                      : selectedItem.Has_Inventory_Data === 0 && selectedItem.Has_Forecast_Data === 0
+                      ? "No inventory record and no forecast found for this SKU this month — nothing to assess yet."
+                      : selectedItem.Has_Inventory_Data === 0
+                      ? "No inventory record found for this SKU this month. Stock buckets below are shown as zero, but this may reflect a data gap rather than confirmed zero stock."
+                      : "No forecast found for this SKU this month — scenario results below assume zero demand."}
+                  </div>
+                )}
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, flexWrap: "wrap" }}>
+                  <StatCell label="Forecast Qty"      value={formatNum(selectedItem.Forecast_Qty)} color={T.teal} />
+                  <StatCell label="Scenario A Unmet"  value={formatNum(selectedItem.A_unmet)}      color={toNumber(selectedItem.A_unmet) > 0 ? T.red : T.green} />
+                  <StatCell label="Scenario B Unmet"  value={formatNum(selectedItem.B_unmet)}      color={toNumber(selectedItem.B_unmet) > 0 ? T.red : T.green} />
+                  <StatCell label="Scenario C Unmet"  value={formatNum(selectedItem.C_unmet)}      color={toNumber(selectedItem.C_unmet) > 0 ? T.red : T.green} />
+                </div>
+              </div>
+
+              <Divider label="Stock Buckets — SKU" />
+              <div className="risk-stock-kpis">
+                <KpiCard title="DB No-Risk"    value={formatNum(selectedItem.Distributor_NoRisk_Qty)}   accent={T.green} />
+                <KpiCard title="DB Short Exp"  value={formatNum(selectedItem.Distributor_ShortExp_Qty)} accent={T.amber} />
+                <KpiCard title="DB Trade"      value={formatNum(selectedItem.Distributor_Trade_Qty)}    accent={T.teal} />
+                <KpiCard title="DB Expired"    value={formatNum(selectedItem.Distributor_Expired_Qty)}  accent={T.red} />
+                <KpiCard title="WH No-Risk"    value={formatNum(selectedItem.Primary_NoRisk_Qty)}       accent={T.green} />
+                <KpiCard title="WH Short Exp"  value={formatNum(selectedItem.Primary_ShortExp_Qty)}     accent={T.amber} />
+                <KpiCard title="WH Trade"      value={formatNum(selectedItem.Primary_Trade_Qty)}        accent={T.blue} />
+                <KpiCard title="WH Inspection" value={formatNum(selectedItem.Inspection_Stock_Qty)}     accent={T.orange} />
+                <KpiCard title="WH Blocked"    value={formatNum(selectedItem.Blocked_Stock_Qty)}        accent={T.crimson} />
+                <KpiCard title="WH Expired"    value={formatNum(selectedItem.Primary_Expired_Qty)}      accent={T.red} />
+              </div>
+
+              <Divider label="Scenario Analysis — SKU" />
+              {isDataGap(selectedItem.Risk_Level) ? (
+                <div style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16,
+                  padding: "26px 20px", color: T.muted, fontSize: 12, textAlign: "center", boxShadow: SHADOW_SM }}>
+                  Scenario analysis isn't meaningful for this SKU yet — {riskLabel(selectedItem.Risk_Level).toLowerCase()}.
+                </div>
+              ) : (
+                <div className="risk-scenarios">
+                  <ScenarioCard title="Scenario A" tag="DB No-Risk Only"
+                    step="A" scenario={itemScenarioA} accent={T.green}
+                    isActive={selectedItem.Risk_Level === "SAFE"} showWH={false} />
+                  <ScenarioCard title="Scenario B" tag="DB Trade"
+                    step="B" scenario={itemScenarioB} accent={T.amber}
+                    isActive={selectedItem.Risk_Level === "UNDER_RISK"} showWH={false} />
+                  <ScenarioCard title="Scenario C" tag="DB + WH Stock"
+                    step="C" scenario={itemScenarioC}
+                    accent={selectedItem.Risk_Level === "CRITICAL_STOCKOUT" ? T.red : T.orange}
+                    isActive={["WH_TRADE_REQUIRED","WH_INSPECTION_REQUIRED","WH_BLOCKED_REQUIRED","CRITICAL_STOCKOUT"].includes(selectedItem.Risk_Level)}
+                    showWH={true} />
+                </div>
+              )}
+            </>
+          )}
+        </>
+      )}
+
+      {/* ── DATA COVERAGE — moved to the BOTTOM of the page ──
+           Data-completeness gaps (not a risk verdict). Clicking a badge
+           still filters the agency list above. ── */}
+      <Divider label="Data Coverage" />
+      <div style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 9.5, color: T.muted, textTransform: "uppercase",
+          letterSpacing: 1.4, fontWeight: 800, marginRight: 2 }}>
+          Data Coverage
+        </span>
+        {[
+          { label: "No Forecast",  count: summary.noForecast,  color: T.blue,  key: "NO_FORECAST_DATA" },
+          { label: "No Inventory", count: summary.noInventory, color: T.blue,  key: "NO_INVENTORY_DATA" },
+          { label: "No Data",      count: summary.noData,      color: T.muted, key: "NO_DATA" },
+          { label: "Not Tracked",  count: summary.notTracked,  color: T.muted, key: "NOT_TRACKED" },
+        ].map(({ label, count, color, key }) => (
+          <SummaryBadge key={key} label={label} count={count} color={color}
+            active={riskFilter === key}
+            onClick={() => setRiskFilter(prev => prev === key ? "ALL" : key)} />
+        ))}
       </div>
     </div>
   );

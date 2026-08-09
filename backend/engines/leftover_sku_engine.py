@@ -78,6 +78,20 @@ TREND_WINDOW_LONG  = 6   # L6M rolling average (stability anchor)
 
 FORECAST_SOURCE_TAG = "TREND_BASELINE"
 
+# BUDGET-ONLY routing (business change 3.1):
+#   - Products with NO standard product code (synthetic "SYN-..." codes)
+#     have no mapping into fact_monthly_closed, so a sales-based forecast
+#     is impossible — the UI can only show their BUDGET.
+#   - Products WITH a real code but NO sales history at all likewise have
+#     nothing to trend from — budget only.
+# These rows are tagged Forecast_Source = BUDGET_ONLY (not TREND_BASELINE)
+# so every downstream page can hide the forecast and show budget instead.
+# NOTE: this status is re-evaluated on every run — the moment such a
+# product gets a standard code and/or starts selling, it automatically
+# moves onto the trend (or model) path.
+BUDGET_ONLY_SOURCE_TAG = "BUDGET_ONLY"
+SYNTHETIC_CODE_PREFIX = "SYN-"
+
 
 def _safe_mean(x) -> float:
     x = pd.to_numeric(pd.Series(x), errors="coerce").dropna()
@@ -179,21 +193,40 @@ def build_trend_forecast_table(
             if sku_hist is not None
             else pd.Series(dtype=float)
         )
-
-        qty, used_model, reason = _trend_forecast_for_sku(sales)
-
         sales_num = pd.to_numeric(sales, errors="coerce").fillna(0).clip(lower=0)
+
+        # ---- BUDGET-ONLY routing (change 3.1) ----------------------
+        # No standard code -> no fact-sales mapping -> budget only.
+        # Real code but zero sales history -> nothing to trend -> budget only.
+        is_synthetic = sku.startswith(SYNTHETIC_CODE_PREFIX)
+        has_history = len(sales_num) > 0
+
+        if is_synthetic:
+            qty, used_model, reason = 0.0, BUDGET_ONLY_SOURCE_TAG, "NO_STANDARD_CODE"
+            source_tag = BUDGET_ONLY_SOURCE_TAG
+            segment = "BUDGET_ONLY"
+        elif not has_history:
+            qty, used_model, reason = 0.0, BUDGET_ONLY_SOURCE_TAG, "NO_SALES_MAPPING"
+            source_tag = BUDGET_ONLY_SOURCE_TAG
+            segment = "BUDGET_ONLY"
+        else:
+            # In master SKU list, not in focus list, HAS sales history
+            # -> simple trend baseline forecast (separate from the model).
+            qty, used_model, reason = _trend_forecast_for_sku(sales)
+            source_tag = FORECAST_SOURCE_TAG
+            segment = "TREND"
+
         rows.append({
             "Run_Date":        run_date,
             "Forecast_Month":  forecast_month_label,
             "ItemCode":        sku,
             "Forecast_Qty":    round(float(qty), 2),
-            "Segment":         "TREND",
+            "Segment":         segment,
             "Used_Model":      used_model,
             "Fallback_Used":   1,
             "Target_Mode":     "rule",
             "Routing_Reason":  reason,
-            "Forecast_Source": FORECAST_SOURCE_TAG,
+            "Forecast_Source": source_tag,
             "Last_Month_Qty":  round(float(sales_num.iloc[-1]), 2) if len(sales_num) else 0.0,
             "L3M_Avg":         round(_safe_mean(sales_num.tail(TREND_WINDOW_SHORT)), 2),
             "L6M_Avg":         round(_safe_mean(sales_num.tail(TREND_WINDOW_LONG)), 2),
@@ -329,31 +362,52 @@ def build_lightweight_dashboard(
         forecast_qty    = _safe_num(master_row.get("Forecast_Qty", 0))
         forecast_source = str(master_row.get("Forecast_Source", "NO_FORECAST"))
 
-        # NOTE: forecast_master_mapped.csv only carries Horizon_M1..M6
-        # quantities, not calendar month labels (those live only in
-        # forecast_horizon_latest.csv, keyed by focus-SKU ItemCode).
-        for h in range(1, 7):
-            col = f"Horizon_M{h}"
-            if col in master_row and pd.notna(master_row[col]):
-                horizon_forecast.append({
-                    "Horizon": f"M+{h}",
-                    "Forecast_Month": None,
-                    "Forecast_Qty": _safe_num(master_row[col]),
-                    "Forecast_Source": forecast_source,
+        # BUDGET-ONLY products (no standard code / no fact-sales mapping):
+        # there is NO forecast to show — only budget. Skip the horizon and
+        # the future-forecast trend point; still extend the trend one month
+        # so the budget overlay has somewhere to render.
+        if forecast_source == BUDGET_ONLY_SOURCE_TAG:
+            if sales_trend:
+                next_label = _next_month_label(sales_trend[-1]["period"])
+            elif budget_series:
+                next_label = sorted(budget_series.keys())[0]
+            if next_label is not None:
+                sales_trend.append({
+                    "period": next_label,
+                    "label": next_label,
+                    "actual": None,
+                    "pastForecast": None,
+                    "futureForecast": None,
+                    "predicted": None,
+                    "isForecast": False,
+                    "budget": budget_series.get(next_label),
                 })
+        else:
+            # NOTE: forecast_master_mapped.csv only carries Horizon_M1..M6
+            # quantities, not calendar month labels (those live only in
+            # forecast_horizon_latest.csv, keyed by focus-SKU ItemCode).
+            for h in range(1, 7):
+                col = f"Horizon_M{h}"
+                if col in master_row and pd.notna(master_row[col]):
+                    horizon_forecast.append({
+                        "Horizon": f"M+{h}",
+                        "Forecast_Month": None,
+                        "Forecast_Qty": _safe_num(master_row[col]),
+                        "Forecast_Source": forecast_source,
+                    })
 
-        if sales_trend:
-            next_label = _next_month_label(sales_trend[-1]["period"])
-            sales_trend.append({
-                "period": next_label,
-                "label": next_label,
-                "actual": None,
-                "pastForecast": None,
-                "futureForecast": forecast_qty,
-                "predicted": forecast_qty,
-                "isForecast": True,
-                "budget": budget_series.get(next_label),
-            })
+            if sales_trend:
+                next_label = _next_month_label(sales_trend[-1]["period"])
+                sales_trend.append({
+                    "period": next_label,
+                    "label": next_label,
+                    "actual": None,
+                    "pastForecast": None,
+                    "futureForecast": forecast_qty,
+                    "predicted": forecast_qty,
+                    "isForecast": True,
+                    "budget": budget_series.get(next_label),
+                })
 
     demand_status = "Unknown"
     if sku_hist is not None and not sku_hist.empty:
@@ -377,9 +431,17 @@ def build_lightweight_dashboard(
         "fallback_used": 1,
         "target_mode": "rule" if forecast_source != "AI_MODEL" else "residual",
         "baseline_used": 0.0,
-        "routing_reason": "LEFTOVER_SKU_LIGHTWEIGHT_PATH",
+        "routing_reason": (
+            "BUDGET_ONLY_NO_FORECAST"
+            if forecast_source == BUDGET_ONLY_SOURCE_TAG
+            else "LEFTOVER_SKU_LIGHTWEIGHT_PATH"
+        ),
 
-        "next_month_forecast": round(forecast_qty, 2),
+        # BUDGET_ONLY products have NO forecast — budget is the only number
+        "next_month_forecast": (
+            None if forecast_source == BUDGET_ONLY_SOURCE_TAG
+            else round(forecast_qty, 2)
+        ),
         "next_month_label": next_label,
         "current_month_actual": round(current_actual, 2),
         "current_month_label": current_label,

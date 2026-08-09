@@ -26,6 +26,7 @@ from services.forecast_service import (
     load_master_forecast_mapped,
     load_raw_actual_history_all_skus,
     get_budget_series_for_sku,
+    load_budget_monthly_series,
 )
 
 from services.horizon_service import (
@@ -48,7 +49,11 @@ from engines.master_forecast_engine import (
 
 from services.artifact_service import artifact_service
 from engines.demand_forecast_engine import forecast_one_sku
-from engines.leftover_sku_engine import build_trend_forecast_table, build_lightweight_dashboard
+from engines.leftover_sku_engine import (
+    build_trend_forecast_table,
+    build_lightweight_dashboard,
+    _get_demand_status_from_sales,
+)
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 BACKEND_DIR = os.path.dirname(BASE_DIR)
@@ -883,6 +888,429 @@ def get_skus_full() -> list:
         pass
 
     return out
+
+
+# ============================================================
+# AGENCY-WISE FORECAST PAGE (business change 4)
+#
+# The Forecast page moves from ITEM-wise to AGENCY-wise: the selector
+# lists agencies, and every KPI / chart is the SAME computation as the
+# item dashboard, aggregated (summed) across all SKUs of that agency.
+# NO new business logic — only aggregation of the existing numbers.
+# Item-wise functions above are kept untouched for internal use /
+# backward compatibility.
+# ============================================================
+def _get_agency_master_rows(agency: str) -> pd.DataFrame:
+    """Master SKU rows for one agency (matched on Agency name OR AgencyCode,
+    case-insensitive)."""
+    try:
+        master_df = load_sku_master_full()
+    except Exception:
+        return pd.DataFrame()
+    if master_df is None or master_df.empty or "ProductCode" not in master_df.columns:
+        return pd.DataFrame()
+
+    m = master_df.copy()
+    m["ProductCode"] = m["ProductCode"].astype(str).str.strip()
+    key = str(agency).strip().upper()
+    agency_norm = m["Agency"].astype(str).str.strip().str.upper()
+    code_norm = m["AgencyCode"].fillna("").astype(str).str.strip().str.upper()
+    return m[(agency_norm == key) | ((code_norm != "") & (code_norm == key))].copy()
+
+
+def get_agencies() -> list:
+    """
+    Agency selector for the agency-wise Forecast page (replaces the item
+    selector). One entry per agency in the master SKU list, with SKU
+    counts so the UI can show coverage.
+    """
+    try:
+        master_df = load_sku_master_full()
+    except Exception:
+        return []
+    if master_df is None or master_df.empty:
+        return []
+
+    focus_codes = set(get_skus())
+
+    m = master_df.copy()
+    m["ProductCode"] = m["ProductCode"].astype(str).str.strip()
+    m["Agency"] = m["Agency"].astype(str).str.strip()
+    m["AgencyCode"] = m["AgencyCode"].fillna("").astype(str).str.strip()
+
+    out = []
+    for agency, g in m.groupby("Agency", dropna=False):
+        codes = set(g["ProductCode"])
+        agency_codes = [c for c in g["AgencyCode"].unique().tolist() if c]
+        out.append({
+            "agency": agency,
+            "agency_code": agency_codes[0] if agency_codes else "",
+            "sku_count": len(codes),
+            "focus_sku_count": len(codes & focus_codes),
+        })
+    return sorted(out, key=lambda x: x["agency"])
+
+
+def get_agency_dashboard(agency: str) -> Optional[dict]:
+    """
+    Agency-wise Forecast dashboard — SAME KPIs and chart series as the
+    item-wise dashboard, aggregated across every SKU of the agency.
+    """
+    master_rows = _get_agency_master_rows(agency)
+    if master_rows.empty:
+        return None
+
+    codes = set(master_rows["ProductCode"].astype(str))
+    agency_name = str(master_rows["Agency"].iloc[0]).strip()
+    agency_code_vals = [
+        c for c in master_rows["AgencyCode"].fillna("").astype(str).str.strip().unique().tolist() if c
+    ]
+    agency_code = agency_code_vals[0] if agency_code_vals else ""
+    focus_codes = set(get_skus()) & codes
+
+    # ---- Monthly actual history (ALL SKUs of the agency, raw fact) ----
+    try:
+        hist = load_raw_actual_history_all_skus()
+    except Exception:
+        hist = pd.DataFrame()
+
+    monthly = pd.DataFrame()
+    if hist is not None and not hist.empty:
+        hist = hist[hist["ItemCode"].astype(str).isin(codes)].copy()
+        if not hist.empty:
+            agg_spec = {"Secondary_Sales_Qty": "sum"}
+            for col, how in [
+                ("Available_Primary_Inventory_Qty", "sum"),
+                ("Distributor_Inventory_Qty", "sum"),
+                ("Free_Qty", "sum"),
+                ("Bonus_Flag", "max"),
+                ("Supply_Constraint_Flag", "max"),
+            ]:
+                if col in hist.columns:
+                    agg_spec[col] = how
+            monthly = (
+                hist.groupby(["Year", "Month_Number"], as_index=False)
+                .agg(agg_spec)
+                .sort_values(["Year", "Month_Number"])
+                .reset_index(drop=True)
+            )
+
+    # ---- KPIs (same formulas as the item dashboard, on agency totals) ----
+    current_actual = last_month_actual = avg_sales = 0.0
+    mom = None
+    current_label = last_label = None
+    current_l3m_avg = last_month_l3m_avg = None
+    current_db_stock = current_wh_stock = last_db_stock = last_wh_stock = 0.0
+    bonus_qty_current = bonus_qty_last = 0.0
+    bonus_shock_current = bonus_shock_last = 0
+    supply_shock_current = supply_shock_last = 0
+
+    if not monthly.empty:
+        cur_row = monthly.iloc[-1]
+        prev_row = monthly.iloc[-2] if len(monthly) > 1 else cur_row
+
+        current_actual = _num(cur_row.get("Secondary_Sales_Qty", 0))
+        last_month_actual = _num(prev_row.get("Secondary_Sales_Qty", 0))
+        if last_month_actual > 0:
+            mom = ((current_actual - last_month_actual) / (last_month_actual + 1e-6)) * 100
+        avg_sales = _num(monthly["Secondary_Sales_Qty"].mean())
+
+        sales_hist = monthly["Secondary_Sales_Qty"].astype(float).tolist()
+        if len(sales_hist) >= 4:
+            current_l3m_avg = (sales_hist[-4] + sales_hist[-3] + sales_hist[-2]) / 3
+        if len(sales_hist) >= 5:
+            last_month_l3m_avg = (sales_hist[-5] + sales_hist[-4] + sales_hist[-3]) / 3
+
+        current_db_stock = _num(cur_row.get("Distributor_Inventory_Qty", 0))
+        last_db_stock = _num(prev_row.get("Distributor_Inventory_Qty", 0))
+        current_wh_stock = _num(cur_row.get("Available_Primary_Inventory_Qty", 0))
+        last_wh_stock = _num(prev_row.get("Available_Primary_Inventory_Qty", 0))
+
+        bonus_qty_current = _num(cur_row.get("Free_Qty", 0))
+        bonus_qty_last = _num(prev_row.get("Free_Qty", 0))
+        bonus_shock_current = int(_num(cur_row.get("Bonus_Flag", 0)))
+        bonus_shock_last = int(_num(prev_row.get("Bonus_Flag", 0)))
+        supply_shock_current = int(_num(cur_row.get("Supply_Constraint_Flag", 0)))
+        supply_shock_last = int(_num(prev_row.get("Supply_Constraint_Flag", 0)))
+
+        current_label = _month_label(cur_row["Year"], cur_row["Month_Number"])
+        last_label = _month_label(prev_row["Year"], prev_row["Month_Number"])
+
+    current_db_shp = (
+        current_db_stock / current_l3m_avg
+        if current_l3m_avg and current_l3m_avg > 0 else None
+    )
+    current_wh_shp = (
+        current_wh_stock / current_l3m_avg
+        if current_l3m_avg and current_l3m_avg > 0 else None
+    )
+    last_db_shp = (
+        last_db_stock / last_month_l3m_avg
+        if last_month_l3m_avg and last_month_l3m_avg > 0 else None
+    )
+    last_wh_shp = (
+        last_wh_stock / last_month_l3m_avg
+        if last_month_l3m_avg and last_month_l3m_avg > 0 else None
+    )
+
+    latest_closed_label = current_label or ""
+
+    # ---- Next-month forecast: SUM over the agency's forecasted SKUs ----
+    # (AI model + trend baseline; BUDGET_ONLY / NO_FORECAST rows carry no
+    # forecast and are excluded — exactly the per-item behavior, summed.)
+    next_forecast = 0.0
+    next_label = None
+    source_counts = {}
+    source_by_code = {}
+    try:
+        mm = load_master_forecast_mapped()
+        if mm is not None and not mm.empty and "ProductCode" in mm.columns:
+            mm = mm.copy()
+            mm["ProductCode"] = mm["ProductCode"].astype(str).str.strip()
+            mm = mm[mm["ProductCode"].isin(codes)]
+            if not mm.empty:
+                source_counts = (
+                    mm["Forecast_Source"].fillna("NO_FORECAST").value_counts().to_dict()
+                )
+                source_by_code = dict(zip(
+                    mm["ProductCode"],
+                    mm["Forecast_Source"].fillna("NO_FORECAST").astype(str),
+                ))
+                fc = mm[mm["Forecast_Source"].isin(["AI_MODEL", "TREND_BASELINE"])]
+                next_forecast = _num(
+                    pd.to_numeric(fc["Forecast_Qty"], errors="coerce").fillna(0).sum()
+                )
+                if "Forecast_Month" in fc.columns:
+                    vals = fc["Forecast_Month"].dropna().astype(str)
+                    if len(vals):
+                        next_label = vals.mode().iloc[0]
+    except Exception:
+        pass
+
+    # SKU list of this agency, for the SKU-wise section of the Forecast
+    # page (search bar + item name/code subheading). Focus SKUs first.
+    sku_list = []
+    for _, mr in master_rows.drop_duplicates(subset=["ProductCode"]).iterrows():
+        code = str(mr["ProductCode"]).strip()
+        sku_list.append({
+            "item_code": code,
+            "product_name": str(mr.get("ProductName", "") or "").strip(),
+            "is_focus": code in focus_codes,
+            "forecast_source": source_by_code.get(code, "NO_FORECAST"),
+        })
+    sku_list.sort(key=lambda s: (not s["is_focus"], s["product_name"] or s["item_code"]))
+
+    # ---- Sales trend: last 12 months of agency totals ----
+    trend_map = {}
+    for _, r in (monthly.tail(12).iterrows() if not monthly.empty else []):
+        label = _month_label(r["Year"], r["Month_Number"])
+        trend_map[label] = {
+            "period": label,
+            "label": label,
+            "actual": _num(r.get("Secondary_Sales_Qty", 0)),
+            "pastForecast": None,
+            "futureForecast": None,
+            "predicted": None,
+            "isForecast": False,
+        }
+
+    # Past M+1 model forecasts, summed over the agency's SKUs per month
+    try:
+        history_df = load_forecast_horizon_history()
+        if history_df is not None and not history_df.empty:
+            history_df = history_df.copy()
+            history_df["ItemCode"] = (
+                history_df["ItemCode"].astype(str).str.replace(r"\.0$", "", regex=True)
+            )
+            past_df = history_df[
+                (history_df["ItemCode"].isin(codes)) &
+                (history_df["Horizon"].astype(str) == "M+1") &
+                (history_df["Forecast_Source"].astype(str) == "AI_CHAMPION_MODEL")
+            ].copy()
+            if not past_df.empty:
+                if "Run_Date" in past_df.columns:
+                    past_df["Run_Date_sort"] = pd.to_datetime(past_df["Run_Date"], errors="coerce")
+                    past_df = past_df.sort_values(["Forecast_Month", "Run_Date_sort"])
+                elif "Run_ID" in past_df.columns:
+                    past_df = past_df.sort_values(["Forecast_Month", "Run_ID"])
+                past_df = past_df.drop_duplicates(
+                    subset=["ItemCode", "Forecast_Month"], keep="last"
+                )
+                sums = (
+                    past_df.groupby("Forecast_Month")["Forecast_Qty"]
+                    .apply(lambda s: pd.to_numeric(s, errors="coerce").fillna(0).sum())
+                )
+                for month_label, qty in sums.items():
+                    month_label = str(month_label)
+                    if month_label <= latest_closed_label:
+                        if month_label not in trend_map:
+                            trend_map[month_label] = {
+                                "period": month_label, "label": month_label,
+                                "actual": None, "pastForecast": None,
+                                "futureForecast": None, "predicted": None,
+                                "isForecast": False,
+                            }
+                        trend_map[month_label]["pastForecast"] = _num(qty)
+    except Exception:
+        pass
+
+    # Future M+1..M+6 horizon, summed over the agency's SKUs per month
+    horizon_forecast = []
+    try:
+        future_df = load_forecast_horizon_latest()
+        if future_df is not None and not future_df.empty:
+            future_df = future_df.copy()
+            future_df["ItemCode"] = (
+                future_df["ItemCode"].astype(str).str.replace(r"\.0$", "", regex=True)
+            )
+            future_df = future_df[future_df["ItemCode"].isin(codes)].copy()
+            if not future_df.empty:
+                def _horizon_num(v):
+                    try:
+                        return int(str(v).replace("M+", ""))
+                    except Exception:
+                        return 999
+
+                future_df["Forecast_Qty"] = pd.to_numeric(
+                    future_df["Forecast_Qty"], errors="coerce"
+                ).fillna(0)
+                grouped = (
+                    future_df.groupby(["Horizon", "Forecast_Month"], as_index=False)
+                    ["Forecast_Qty"].sum()
+                )
+                grouped["Horizon_Num"] = grouped["Horizon"].apply(_horizon_num)
+                grouped = grouped.sort_values("Horizon_Num")
+
+                for _, r in grouped.iterrows():
+                    month_label = str(r["Forecast_Month"])
+                    qty = _num(r["Forecast_Qty"])
+                    horizon_forecast.append({
+                        "Horizon": str(r["Horizon"]),
+                        "Forecast_Month": month_label,
+                        "Forecast_Qty": qty,
+                        "Forecast_Source": "AGENCY_AGGREGATE",
+                    })
+                    if month_label > latest_closed_label:
+                        if month_label not in trend_map:
+                            trend_map[month_label] = {
+                                "period": month_label, "label": month_label,
+                                "actual": None, "pastForecast": None,
+                                "futureForecast": None, "predicted": None,
+                                "isForecast": True,
+                            }
+                        trend_map[month_label]["futureForecast"] = qty
+                        trend_map[month_label]["predicted"] = qty
+                        trend_map[month_label]["isForecast"] = True
+                if next_label is None and horizon_forecast:
+                    next_label = horizon_forecast[0]["Forecast_Month"]
+    except Exception:
+        if next_label:
+            trend_map[next_label] = {
+                "period": next_label, "label": next_label,
+                "actual": None, "pastForecast": None,
+                "futureForecast": next_forecast, "predicted": next_forecast,
+                "isForecast": True,
+            }
+
+    # ---- Budget overlay: agency total budget per month ----
+    budget_series = {}
+    try:
+        budget_df = load_budget_monthly_series()
+        if budget_df is not None and not budget_df.empty:
+            budget_df = budget_df[budget_df["ItemCode"].astype(str).isin(codes)]
+            if not budget_df.empty:
+                budget_series = (
+                    budget_df.groupby("Month")["Budget_Qty"].sum().to_dict()
+                )
+    except Exception:
+        pass
+    for point in trend_map.values():
+        point["budget"] = budget_series.get(point["period"])
+
+    sales_trend = sorted(trend_map.values(), key=lambda x: x["period"])
+
+    # ---- Inventory / shock trends (agency monthly totals) ----
+    inventory_trend = []
+    shock_trend = []
+    for _, r in (monthly.tail(12).iterrows() if not monthly.empty else []):
+        label = _month_label(r["Year"], r["Month_Number"])
+        inventory_trend.append({
+            "label": label,
+            "primaryInventory": _num(r.get("Available_Primary_Inventory_Qty", 0)),
+            "distInventory": _num(r.get("Distributor_Inventory_Qty", 0)),
+        })
+        shock_trend.append({
+            "label": label,
+            "bonusQty": _num(r.get("Free_Qty", 0)),
+            "bonusFlag": int(_num(r.get("Bonus_Flag", 0))),
+            "supplyFlag": int(_num(r.get("Supply_Constraint_Flag", 0))),
+        })
+
+    demand_status = (
+        _get_demand_status_from_sales(monthly["Secondary_Sales_Qty"])
+        if not monthly.empty else "Unknown"
+    )
+
+    return {
+        # identity — agency-wise now; item_code kept (None) so existing
+        # frontend field access doesn't break
+        "agency": agency_name,
+        "agency_code": agency_code,
+        "item_code": None,
+        "as_of": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+
+        "data_completeness": "AGENCY_AGGREGATE",
+        "sku_count": len(codes),
+        "focus_sku_count": len(focus_codes),
+        "forecast_source_counts": source_counts,
+        "skus": sku_list,
+
+        "abc_category": None,
+        "demand_status": demand_status,
+
+        "forecast_source": "AGENCY_AGGREGATE",
+        "segment": "AGENCY",
+        "used_model": "AGENCY_AGGREGATE",
+        "fallback_used": 0,
+        "target_mode": "aggregate",
+        "baseline_used": 0.0,
+        "routing_reason": "AGENCY_WISE_VIEW",
+
+        # headline numbers (same keys as item dashboard)
+        "next_month_forecast": round(next_forecast, 2),
+        "next_month_label": next_label,
+        "current_month_actual": round(current_actual, 2),
+        "current_month_label": current_label,
+        "last_month_actual": round(last_month_actual, 2),
+        "last_month_label": last_label,
+        "mom_change": round(float(mom), 2) if mom is not None else None,
+        "avg_monthly_sales": round(float(avg_sales), 2),
+
+        "current_l3m_avg": round(current_l3m_avg, 2) if current_l3m_avg is not None else None,
+        "last_month_l3m_avg": round(last_month_l3m_avg, 2) if last_month_l3m_avg is not None else None,
+
+        "current_db_stock": round(current_db_stock, 2),
+        "current_wh_stock": round(current_wh_stock, 2),
+        "last_db_stock": round(last_db_stock, 2),
+        "last_wh_stock": round(last_wh_stock, 2),
+
+        "current_db_shp": round(current_db_shp, 2) if current_db_shp is not None else None,
+        "current_wh_shp": round(current_wh_shp, 2) if current_wh_shp is not None else None,
+        "last_db_shp": round(last_db_shp, 2) if last_db_shp is not None else None,
+        "last_wh_shp": round(last_wh_shp, 2) if last_wh_shp is not None else None,
+
+        "bonus_qty_current_month": round(float(bonus_qty_current), 2),
+        "bonus_qty_last_month": round(float(bonus_qty_last), 2),
+        "bonus_shock_current_month": bonus_shock_current,
+        "bonus_shock_last_month": bonus_shock_last,
+        "supply_shock_current_month": supply_shock_current,
+        "supply_shock_last_month": supply_shock_last,
+
+        "sales_trend": sales_trend,
+        "inventory_trend": inventory_trend,
+        "shock_trend": shock_trend,
+        "horizon_forecast": horizon_forecast,
+    }
 
 
 def reload_data_now():

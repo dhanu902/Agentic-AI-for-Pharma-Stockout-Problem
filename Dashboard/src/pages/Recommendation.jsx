@@ -2,7 +2,10 @@
 //
 // AI Planner — UI v2, visually aligned with Insights.jsx.
 // All data flow, filtering, tabs, search and pagination logic unchanged.
-// Consumes GET /api/recommendation/results.
+// v3 — AGENCY-WISE (business change 6): rows are one per AGENCY instead
+//      of one per item. The planner still scores items exactly as before;
+//      the backend aggregates them per agency (sums, worst-case action).
+// Consumes GET /api/recommendation/results_by_agency.
 //
 // Layout (planner-style — situation first, actions second):
 //   1. Glass header + confidence pill + refresh
@@ -13,7 +16,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import T from "../theme";
 
-const API_URL = "/api/recommendation/results";
+const API_URL = "/api/recommendation/results_by_agency";
 const PAGE_SIZE = 20;
 
 /* ─── Helpers ────────────────────────────────────────────────── */
@@ -30,9 +33,9 @@ function fmtDec(v, d = 2) {
 /* ─── Design tokens (UI only — matches Insights.jsx) ─────────── */
 const FONT_UI   = "'Inter', 'IBM Plex Sans', sans-serif";
 const FONT_MONO = "'JetBrains Mono', monospace";
-const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.05)";
-const SHADOW_MD = "0 1px 3px rgba(16,24,40,0.06), 0 12px 28px -16px rgba(16,24,40,0.18)";
-const SHADOW_LG = "0 2px 6px rgba(16,24,40,0.06), 0 24px 48px -24px rgba(16,24,40,0.22)";
+const SHADOW_SM = "0 1px 2px rgba(16,24,40,0.04), 0 6px 18px -12px rgba(16,24,40,0.10)";
+const SHADOW_MD = "0 2px 4px rgba(16,24,40,0.05), 0 16px 40px -20px rgba(16,24,40,0.22)";
+const SHADOW_LG = "0 4px 10px rgba(16,24,40,0.06), 0 34px 68px -30px rgba(16,24,40,0.30)";
 
 const ACTION_META = {
   STOP_PROCUREMENT:     { label: "Stop Procurement",     color: T.red },
@@ -114,6 +117,45 @@ const GlobalStyle = () => (
       border-radius: 6px;
     }
     .rec-live-dot { animation: rec-pulse-dot 1.8s ease infinite; }
+
+    /* ═══ v5 visual refresh — pure CSS, no logic ═══ */
+    .page-shell { position: relative; }
+    .page-shell::before {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background-image: radial-gradient(${T.muted}30 1px, transparent 1px);
+      background-size: 24px 24px;
+      -webkit-mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+              mask-image: radial-gradient(1000px 560px at 15% -5%, black, transparent 70%);
+    }
+    .page-shell::after {
+      content: ""; position: fixed; inset: 0; z-index: 0; pointer-events: none;
+      background:
+        radial-gradient(760px 380px at 108% 8%, ${T.purple}12, transparent 65%),
+        radial-gradient(640px 340px at -8% 88%, ${T.red}0E, transparent 60%);
+      animation: aurora-drift 18s ease-in-out infinite alternate;
+    }
+    .page-shell > * { position: relative; z-index: 1; }
+    @keyframes aurora-drift {
+      from { opacity: 0.6; transform: translate3d(0,-10px,0); }
+      to   { opacity: 1;   transform: translate3d(0,12px,0); }
+    }
+    @keyframes hero-float {
+      0%, 100% { transform: translateY(0) rotate(0deg); }
+      50%      { transform: translateY(-4px) rotate(-3deg); }
+    }
+    .hero-icon { animation: hero-float 5.5s ease-in-out infinite; }
+    .rec-kpi { border-radius: 18px !important; }
+    .rec-kpi:hover {
+      transform: translateY(-3px);
+      border-color: ${T.purple}55 !important;
+      box-shadow: 0 2px 8px rgba(16,24,40,0.06), 0 30px 60px -26px ${T.purple}4D !important;
+    }
+    .rec-btn { border-radius: 11px !important; }
+    .rec-btn:not(:disabled):hover  { transform: translateY(-1px) scale(1.015); filter: saturate(1.12) brightness(1.03); }
+    .rec-btn:not(:disabled):active { transform: translateY(0) scale(0.985); }
+    .rec-row:hover td { box-shadow: inset 0 0 0 999px ${T.purple}08; }
+    input::placeholder { color: ${T.muted}AA; }
+    ::selection { background: ${T.purple}2E; }
   `}</style>
 );
 
@@ -451,6 +493,7 @@ export default function Recommendations() {
   useEffect(() => { fetchResults(); }, []);
   useEffect(() => setPage(1), [tab, search]);
 
+  // CHANGED (agency-wise): rows are agencies; search matches agency name/code
   const rows = useMemo(() => {
     if (!data) return [];
     let r = data.recommendations || [];
@@ -458,7 +501,9 @@ export default function Recommendations() {
     else if (tab !== "ALL") r = r.filter((x) => x.action === tab);
     if (search.trim()) {
       const q = search.trim().toLowerCase();
-      r = r.filter((x) => String(x.ItemCode).toLowerCase().includes(q));
+      r = r.filter((x) =>
+        String(x.agency).toLowerCase().includes(q) ||
+        String(x.agency_code || "").toLowerCase().includes(q));
     }
     return r;
   }, [data, tab, search]);
@@ -484,7 +529,7 @@ export default function Recommendations() {
   const tabAccent = (TABS.find(t => t.key === tab) || {}).accent || T.purple;
 
   return (
-    <div style={{ minHeight: "100vh",
+    <div className="page-shell" style={{ minHeight: "100vh",
       background: `radial-gradient(1100px 500px at 85% -10%, ${T.purple}0E, transparent 60%),
                    radial-gradient(900px 420px at -10% 0%, ${T.blue}0C, transparent 55%),
                    ${T.bg}`,
@@ -500,7 +545,7 @@ export default function Recommendations() {
         border: `1px solid ${T.border}`, borderRadius: 16,
         boxShadow: SHADOW_MD, padding: "18px 22px", marginBottom: 22 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 15 }}>
-          <div style={{ width: 44, height: 44, borderRadius: 13, flexShrink: 0,
+          <div className="hero-icon" style={{ width: 44, height: 44, borderRadius: 13, flexShrink: 0,
             background: `linear-gradient(135deg, ${T.red}, ${T.purple})`,
             display: "flex", alignItems: "center", justifyContent: "center",
             fontSize: 20, color: "#fff",
@@ -531,6 +576,10 @@ export default function Recommendations() {
                   <span style={{ background: T.blue + "12", border: `1px solid ${T.blue}2E`,
                     borderRadius: 999, padding: "2px 10px", fontWeight: 700, color: T.blue }}>
                     {formatNum(run_meta.n_items_scored)} SKUs scored
+                  </span>
+                  <span style={{ background: T.teal + "12", border: `1px solid ${T.teal}2E`,
+                    borderRadius: 999, padding: "2px 10px", fontWeight: 700, color: T.teal }}>
+                    {formatNum(run_meta.n_agencies)} agencies
                   </span>
                   <span style={{ background: T.purple + "12", border: `1px solid ${T.purple}2E`,
                     borderRadius: 999, padding: "2px 10px", fontWeight: 700, color: T.purple }}>
@@ -652,7 +701,7 @@ export default function Recommendations() {
           <span style={{ fontSize: 9, color: T.muted, fontWeight: 800,
             textTransform: "uppercase", letterSpacing: 1 }}>Search</span>
           <input value={search} onChange={(e) => setSearch(e.target.value)}
-            placeholder="Item code…"
+            placeholder="Agency…"
             style={{ background: "transparent", border: "none", color: T.text,
               fontSize: 12.5, fontFamily: FONT_MONO, fontWeight: 600,
               padding: "6px 4px", outline: "none", width: 150 }} />
@@ -681,7 +730,7 @@ export default function Recommendations() {
           <span style={{ background: tabAccent + "14", border: `1px solid ${tabAccent}30`,
             color: tabAccent, borderRadius: 999, padding: "4px 12px", fontSize: 11,
             fontWeight: 900, fontFamily: FONT_MONO }}>
-            {rows.length} SKUs
+            {rows.length} Agencies
           </span>
         </div>
 
@@ -697,22 +746,22 @@ export default function Recommendations() {
                 fontFamily: FONT_MONO, fontSize: 11 }}>
                 <thead>
                   <tr>
-                    {["#", "Item Code", "Risk Score", "Action", "Priority",
-                      "Cover (Mo)", "Gap Qty", "Suggested Order", "Licence (Imp/Reg)", "Reasons"]
+                    {["#", "Agency", "Risk Score", "Action", "Priority",
+                      "Cover (Mo)", "Gap Qty", "Suggested Order", "Items Flagged", "Reasons"]
                       .map(h => <th key={h} style={thStyle}>{h}</th>)}
                   </tr>
                   <tr>
                     {Array.from({ length: 2 }).map((_, i) => (
                       <th key={i} style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
                     ))}
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.red }}>Weighted factors</th>
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>Gated decision</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.red }}>Demand-weighted</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>Worst item action</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }} />
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.amber }}>No-risk stock ÷ demand</th>
                     <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>To target cover</th>
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.green }}>MOQ / multiple applied</th>
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Days remaining</th>
-                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>Why</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.green }}>Sum of item orders</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34, color: T.purple }}>Of tracked items</th>
+                    <th style={{ ...thStyle, fontSize: 8, padding: "3px 14px", top: 34 }}>Why (top item drivers)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -726,25 +775,18 @@ export default function Recommendations() {
                       cover < 0.5 ? T.red :
                       cover < 1 ? T.amber : T.text;
                     return (
-                      <tr key={`${r.ItemCode}-${rowNum}`} className="rec-row"
+                      <tr key={`${r.agency}-${rowNum}`} className="rec-row"
                         onMouseEnter={e => e.currentTarget.style.background = meta.color + "0D"}
                         onMouseLeave={e => e.currentTarget.style.background = "transparent"}>
                         <td style={{ ...tdBase, background: bg, color: T.muted, textAlign: "right", minWidth: 36 }}>{rowNum}</td>
-                        {/* Unmapped/new products carry synthetic keys "label::agency::product" —
-                            display the label + product, keep the full key in the tooltip */}
+                        {/* CHANGED (agency-wise): one row per agency */}
                         <td style={{ ...tdBase, background: bg, color: T.blue, fontWeight: 900 }}
-                          title={String(r.ItemCode)}>
-                          {String(r.ItemCode).includes("::") ? (
-                            <span>
-                              {String(r.ItemCode).split("::")[0]}
-                              <InfoTag text="New" color={T.teal} />
-                              <div style={{ fontSize: 9, color: T.muted, fontWeight: 500,
-                                fontFamily: FONT_UI, marginTop: 2, maxWidth: 160,
-                                overflow: "hidden", textOverflow: "ellipsis" }}>
-                                {String(r.ItemCode).split("::")[2] || String(r.ItemCode).split("::")[1]}
-                              </div>
-                            </span>
-                          ) : r.ItemCode}
+                          title={r.agency_code ? `${r.agency} (${r.agency_code})` : r.agency}>
+                          {r.agency}
+                          {r.agency_code && (
+                            <div style={{ fontSize: 9, color: T.muted, fontWeight: 500,
+                              fontFamily: FONT_UI, marginTop: 2 }}>{r.agency_code}</div>
+                          )}
                         </td>
                         <td style={{ ...tdBase, background: bg, minWidth: 120 }}>
                           <RiskBar score={r.risk_score} />
@@ -770,7 +812,11 @@ export default function Recommendations() {
                           {r.action === "STOP_PROCUREMENT" ? "—"
                             : toNumber(r.suggested_qty) > 0 ? formatNum(r.suggested_qty) : "—"}
                         </td>
-                        <LicenceCell impDays={r.import_days} regDays={r.reg_days} bg={bg} />
+                        <td style={{ ...tdBase, background: bg, textAlign: "right",
+                          color: toNumber(r.n_flagged_items) > 0 ? T.amber : T.muted,
+                          fontWeight: toNumber(r.n_flagged_items) > 0 ? 900 : 400 }}>
+                          {formatNum(r.n_flagged_items)} / {formatNum(r.n_items)}
+                        </td>
                         <td style={{ ...tdBase, background: bg, whiteSpace: "normal", maxWidth: 300, minWidth: 200 }}>
                           {(r.reasons || []).map((c) => <Chip key={c} code={c} />)}
                         </td>

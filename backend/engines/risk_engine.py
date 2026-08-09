@@ -103,32 +103,63 @@ def classify_expiry_bucket(
     expiry_date: pd.Series,
     base_month_start: pd.Timestamp,
     cutoff_date: pd.Timestamp,
+    expired_asof: Optional[pd.Timestamp] = None,
 ) -> pd.Series:
     """
-    ShortExp_Date = ExpiryDate - 3 months.
+    Split a batch-level expiry column into EXPIRED / SHORT_EXP / NO_RISK.
+    This is the ONE definition used by both the Inventory/Risk page and
+    the Insights page.
 
-    EXPIRED:
-        ExpiryDate < Base_Month_Start
+    ShortExp_Date = ExpiryDate - 3 months — the date a batch enters its
+    final three months and becomes short-dated.
+    Cutoff_Date   = base month start + 3 months (see risk_cutoff_date);
+                    equivalently forecast month (M+1) + 2 months.
 
-    SHORT_EXP:
-        ShortExp_Date is between Base_Month_Start and Cutoff_Date
+        EXPIRED   : ExpiryDate < `expired_asof`
+        SHORT_EXP : not expired AND ShortExp_Date <= Cutoff_Date
+                    (i.e. Cutoff_Date >= ShortExp_Date — the batch is
+                    already short-dated, or becomes short-dated on or
+                    before the cutoff)
+        NO_RISK   : not expired AND ShortExp_Date >  Cutoff_Date
+        UNKNOWN   : no expiry date on the batch
 
-    NO_RISK:
-        Not expired and not short-exp risk
+    Full trade quantity therefore splits as
+        raw qty = EXPIRED + SHORT_EXP + NO_RISK
+        sellable trade qty = SHORT_EXP + NO_RISK
+    with Blocked / Inspection stock tracked separately from the sheet.
+
+    `expired_asof` — the date "expired" is measured against:
+        None (default) -> today. Correct for the Risk/Inventory page,
+            which is a LIVE forward view: stock that has expired since the
+            month opened really is gone.
+        A month start   -> what Insights passes. Insights reports on a
+            CLOSED month, so it must ask "was this expired during that
+            month", not "is it expired now". Otherwise re-running June's
+            report in August would mark batches expired that were sellable
+            all through June, and the same report would change every day.
+
+    Boundary: ShortExp_Date == Cutoff_Date counts as SHORT_EXP. The source
+    spreadsheet used strict `<` for no-risk and strict `>` for short-exp,
+    which put an exact tie in NEITHER bucket and silently dropped that
+    batch's quantity out of the trade total. Ties resolve to the
+    conservative side here so the three buckets always re-sum to the raw
+    quantity.
     """
     expiry_date = safe_datetime(expiry_date)
     short_exp_date = expiry_date - DateOffset(months=3)
 
-    out = pd.Series("NO_RISK", index=expiry_date.index, dtype="object")
-    out.loc[expiry_date.isna()] = "UNKNOWN"
-    out.loc[expiry_date < base_month_start] = "EXPIRED"
+    if expired_asof is None:
+        expired_asof = pd.Timestamp(datetime.now().date())
+    else:
+        expired_asof = pd.Timestamp(expired_asof)
 
-    out.loc[
-        (expiry_date.notna()) &
-        (expiry_date >= base_month_start) &
-        (short_exp_date >= base_month_start) &
-        (short_exp_date <= cutoff_date)
-    ] = "SHORT_EXP"
+    known   = expiry_date.notna()
+    expired = known & (expiry_date < expired_asof)
+
+    out = pd.Series("NO_RISK", index=expiry_date.index, dtype="object")
+    out.loc[~known] = "UNKNOWN"
+    out.loc[expired] = "EXPIRED"
+    out.loc[known & (~expired) & (short_exp_date <= cutoff_date)] = "SHORT_EXP"
 
     return out
 
@@ -208,14 +239,21 @@ def build_distributor_inventory_snapshot(
     db_df: pd.DataFrame,
     base_month_start: pd.Timestamp,
     cutoff_date: pd.Timestamp,
+    expired_asof: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     """
     Output per SKU:
-        - Distributor_Total_Qty
+        - Distributor_Total_Qty   (= Expired + ShortExp + NoRisk)
         - Distributor_Expired_Qty
         - Distributor_ShortExp_Qty
         - Distributor_NoRisk_Qty
         - Distributor_Trade_Qty   (= NoRisk + ShortExp)
+
+    UnitQty is the raw batch quantity and splits across the three expiry
+    buckets; only ShortExp + NoRisk is actually sellable.
+
+    `expired_asof` — see classify_expiry_bucket(). Defaults to today
+    (Risk page); Insights passes its reporting month.
     """
     df = db_df.copy()
 
@@ -233,7 +271,9 @@ def build_distributor_inventory_snapshot(
     df["ItemCode"] = normalize_itemcode(df["ItemCode"])
     df["UnitQty"] = safe_numeric(df[qty_col], 0.0).clip(lower=0)
     df["ItemExpiryDate"] = safe_datetime(df[expiry_col])
-    df["Expiry_Bucket"] = classify_expiry_bucket(df["ItemExpiryDate"],base_month_start,cutoff_date,)
+    df["Expiry_Bucket"] = classify_expiry_bucket(
+        df["ItemExpiryDate"], base_month_start, cutoff_date, expired_asof,
+    )
     grouped = []
     for item_code, g in df.groupby("ItemCode", dropna=False):
         total_qty = float(g["UnitQty"].sum())
@@ -274,10 +314,25 @@ def build_warehouse_inventory_snapshot(
     wh_df: pd.DataFrame,
     base_month_start: pd.Timestamp,
     cutoff_date: pd.Timestamp,
+    expired_asof: Optional[pd.Timestamp] = None,
 ) -> pd.DataFrame:
     """
-    Trade Qty = primary trade stock.
-    Primary_Trade_Qty = Primary_NoRisk_Qty + Primary_ShortExp_Qty
+    The sheet's "Trade Qty" is the RAW batch quantity — it still contains
+    expired stock, so it splits across all three buckets:
+
+        Trade Qty  = Primary_Expired_Qty + Primary_ShortExp_Qty
+                                         + Primary_NoRisk_Qty
+        Primary_Trade_Qty (actually sellable)
+                   = Primary_NoRisk_Qty  + Primary_ShortExp_Qty
+
+    Blocked and Insp come straight from their own sheet columns and sit
+    outside the trade pool entirely.
+
+    The sheet's Expiry / ShortExp / Cutoff columns are ignored — they are
+    blank in the source workbook and these values are derived here.
+
+    `expired_asof` — see classify_expiry_bucket(). Defaults to today
+    (Risk page); Insights passes its reporting month.
     """
     df = wh_df.copy()
 
@@ -295,7 +350,9 @@ def build_warehouse_inventory_snapshot(
     df["Trade_Qty"] = safe_numeric(df["Trade Qty"], 0.0).clip(lower=0)
     df["Blocked_Qty"] = safe_numeric(df.get("Blocked", 0), 0.0).clip(lower=0)
     df["Insp_Qty"] = safe_numeric(df.get("Insp", 0), 0.0).clip(lower=0)
-    df["Expiry_Bucket"] = classify_expiry_bucket(df["ItemExpiryDate"], base_month_start, cutoff_date,)
+    df["Expiry_Bucket"] = classify_expiry_bucket(
+        df["ItemExpiryDate"], base_month_start, cutoff_date, expired_asof,
+    )
 
     df["Primary_NoRisk_Qty_Row"] = 0.0
     df["Primary_ShortExp_Qty_Row"] = 0.0

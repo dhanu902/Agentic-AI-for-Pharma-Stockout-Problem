@@ -518,3 +518,189 @@ def get_recommendations(agency: Optional[str] = None,
         "confidence": result["factor_coverage"]["confidence"],
     }
     return result
+
+
+# ============================================================
+# AGENCY-WISE RECOMMENDATIONS (business change 6)
+#
+# The Recommendation page moves from ITEM-wise to AGENCY-wise. The
+# planner logic is UNCHANGED — items are still scored exactly as before
+# by get_recommendations(); this layer only aggregates the scored items
+# per agency (mapping ProductCode -> Agency via the master SKU list):
+#   quantities  -> summed
+#   cover       -> agency no-risk stock / agency effective demand
+#   risk score  -> demand-weighted average of item scores
+#   action/prio -> the most severe among the agency's items
+# ============================================================
+_ACTION_SEVERITY = {
+    "STOP_PROCUREMENT": 5,
+    "RENEW_IMPORT_LICENCE": 4,
+    "REORDER_URGENT": 3,
+    "REORDER_REVIEW": 2,
+    "MONITOR": 1,
+    "OK": 0,
+}
+_PRIORITY_SEVERITY = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
+
+
+def _load_agency_lookup() -> dict:
+    """ProductCode -> {agency, agency_code} from the master SKU list."""
+    try:
+        from services.sku_master_service import load_sku_master_full
+        master_df = load_sku_master_full()
+        if master_df is None or master_df.empty:
+            return {}
+        m = master_df.copy()
+        m["ProductCode"] = m["ProductCode"].astype(str).str.strip()
+        m = m.drop_duplicates(subset=["ProductCode"])
+        return {
+            row["ProductCode"]: {
+                "agency": str(row.get("Agency", "") or "").strip() or "UNMAPPED",
+                "agency_code": str(row.get("AgencyCode", "") or "").strip(),
+            }
+            for _, row in m.iterrows()
+        }
+    except Exception as e:
+        print(f"[RECO] agency lookup unavailable: {e}")
+        return {}
+
+
+def get_recommendations_by_agency(min_priority: Optional[str] = None) -> dict:
+    """Agency-wise planner view. Same KPIs/summary shape as the item-wise
+    planner; rows are one per AGENCY instead of one per item."""
+    result = get_recommendations()  # full item-level run, logic unchanged
+
+    agency_lookup = _load_agency_lookup()
+
+    groups: dict = {}
+    for item in result["all_items"]:
+        code = str(item[COL_ITEM]).strip()
+        info = agency_lookup.get(code, {"agency": "UNMAPPED", "agency_code": ""})
+        groups.setdefault((info["agency"], info["agency_code"]), []).append(item)
+
+    def _num(v, default=0.0):
+        try:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return float(default)
+            return float(v)
+        except Exception:
+            return float(default)
+
+    agency_rows = []
+    for (agency, agency_code), items in groups.items():
+        eff_demand = sum(_num(i.get("effective_demand")) for i in items)
+        no_risk = sum(_num(i.get("no_risk_stock")) for i in items)
+        trade = sum(_num(i.get("trade_stock")) for i in items)
+        gap = sum(_num(i.get("gap_qty")) for i in items)
+        suggested = sum(_num(i.get("suggested_qty")) for i in items)
+
+        # demand-weighted risk score (falls back to plain mean when the
+        # agency has no forecast demand at all)
+        if eff_demand > 0:
+            risk = sum(
+                _num(i.get("risk_score")) * _num(i.get("effective_demand"))
+                for i in items
+            ) / eff_demand
+        else:
+            risk = (
+                sum(_num(i.get("risk_score")) for i in items) / len(items)
+                if items else 0.0
+            )
+
+        cover = (no_risk / eff_demand) if eff_demand > 0 else None
+
+        worst_action = max(
+            (i.get("action", "OK") for i in items),
+            key=lambda a: _ACTION_SEVERITY.get(a, 0),
+        )
+        worst_priority = max(
+            (i.get("priority", "LOW") for i in items),
+            key=lambda p: _PRIORITY_SEVERITY.get(p, 0),
+        )
+
+        action_counts = {}
+        for i in items:
+            a = i.get("action", "OK")
+            action_counts[a] = action_counts.get(a, 0) + 1
+
+        # top item-level drivers, so the agency row stays explainable
+        flagged = sorted(
+            (i for i in items if i.get("action", "OK") != "OK"),
+            key=lambda i: _num(i.get("risk_score")),
+            reverse=True,
+        )
+        top_items = [
+            {
+                "item_code": i[COL_ITEM],
+                "action": i.get("action"),
+                "priority": i.get("priority"),
+                "risk_score": i.get("risk_score"),
+                "cover_months": i.get("cover_months"),
+                "suggested_qty": i.get("suggested_qty"),
+            }
+            for i in flagged[:10]
+        ]
+
+        reasons = []
+        for i in flagged:
+            for rc in (i.get("reasons") or []):
+                if rc not in reasons:
+                    reasons.append(rc)
+
+        agency_rows.append({
+            "agency": agency,
+            "agency_code": agency_code,
+            "n_items": len(items),
+            "n_flagged_items": len(flagged),
+            "risk_score": round(risk, 1),
+            "action": worst_action,
+            "priority": worst_priority,
+            "confidence": result["factor_coverage"]["confidence"],
+            "cover_months": round(cover, 2) if cover is not None else None,
+            "effective_demand": round(eff_demand),
+            "gap_qty": round(gap),
+            "suggested_qty": round(suggested),
+            "no_risk_stock": round(no_risk),
+            "trade_stock": round(trade),
+            "action_counts": action_counts,
+            "reasons": reasons[:15],
+            "top_items": top_items,
+        })
+
+    agency_rows.sort(
+        key=lambda r: (
+            _PRIORITY_SEVERITY.get(r["priority"], 0),
+            r["risk_score"],
+        ),
+        reverse=True,
+    )
+
+    recs = [r for r in agency_rows if r["action"] != "OK"]
+    if min_priority:
+        floor = _PRIORITY_SEVERITY.get(min_priority.upper(), 0)
+        recs = [
+            r for r in recs
+            if _PRIORITY_SEVERITY.get(r["priority"], 0) >= floor
+        ]
+
+    return {
+        "recommendations": recs,
+        "all_agencies": agency_rows,
+        "factor_coverage": result["factor_coverage"],
+        "summary": result["summary"],
+        "run_meta": {
+            **result["run_meta"],
+            "view": "AGENCY",
+            "n_agencies": len(agency_rows),
+            "n_recommendations": len(recs),
+        },
+        # same KPI keys as the item-wise page, computed over agency rows
+        "kpis": {
+            "stop_procurement": sum(1 for r in recs if r["action"] == "STOP_PROCUREMENT"),
+            "renew_licence": sum(1 for r in recs if r["action"] == "RENEW_IMPORT_LICENCE"),
+            "critical": sum(1 for r in recs if r["action"] == "REORDER_URGENT"),
+            "reorder_review": sum(1 for r in recs if r["action"] == "REORDER_REVIEW"),
+            "monitor": sum(1 for r in recs if r["action"] == "MONITOR"),
+            "confidence": result["factor_coverage"]["confidence"],
+        },
+    }
