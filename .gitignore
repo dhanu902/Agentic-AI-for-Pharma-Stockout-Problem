@@ -38,4 +38,5 @@ __pycache__/
 
 models/
 data/
-ENV/
+notebooks/Forecast_Model/catboost_info/
+reminder.txt
