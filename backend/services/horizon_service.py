@@ -262,7 +262,109 @@ def run_horizon_risk_pipeline():
 
 
 def get_horizon_results() -> pd.DataFrame:
-    """Load risk_horizon_latest.csv for the Horizon page route."""
+    """Load risk_horizon_latest.csv for the Horizon page route (item-wise;
+    kept for internal use / backward compatibility)."""
     if not os.path.exists(RISK_HORIZON_LATEST_PATH):
         return pd.DataFrame()
     return pd.read_csv(RISK_HORIZON_LATEST_PATH)
+
+
+# ============================================================
+# AGENCY-WISE INVENTORY PROJECTION (business change 5)
+#
+# The Inventory Projection page moves from ITEM-wise to AGENCY-wise:
+# the SAME projection rows (risk_horizon_latest.csv, unchanged logic)
+# are aggregated per agency — quantity columns are SUMMED across every
+# SKU of the agency for each horizon month. Agency mapping comes from
+# the master SKU list (sku_master_full.csv). No projection math changes.
+# ============================================================
+def get_horizon_results_by_agency() -> pd.DataFrame:
+    df = get_horizon_results()
+    if df.empty or "ItemCode" not in df.columns:
+        return df
+
+    # Lazy import to avoid any service-load-order issues
+    from services.sku_master_service import load_sku_master_full
+
+    df = df.copy()
+    df["ItemCode"] = _normalize_itemcode(df["ItemCode"])
+
+    try:
+        master_df = load_sku_master_full()
+    except Exception:
+        master_df = pd.DataFrame()
+
+    if master_df is not None and not master_df.empty and "ProductCode" in master_df.columns:
+        m = master_df.copy()
+        m["ProductCode"] = m["ProductCode"].astype(str).str.strip()
+        m = m.drop_duplicates(subset=["ProductCode"])
+        df = df.merge(
+            m[["ProductCode", "Agency", "AgencyCode"]].rename(
+                columns={"ProductCode": "ItemCode"}
+            ),
+            on="ItemCode",
+            how="left",
+        )
+    else:
+        df["Agency"] = None
+        df["AgencyCode"] = None
+
+    df["Agency"] = df["Agency"].fillna("UNMAPPED").astype(str).str.strip()
+    df["AgencyCode"] = df["AgencyCode"].fillna("").astype(str).str.strip()
+
+    # Group keys: agency + whatever horizon/month labels the file carries
+    group_keys = ["Agency"]
+    for c in ["Horizon", "Forecast_Month", "Month", "Base_Month"]:
+        if c in df.columns:
+            group_keys.append(c)
+
+    # SUM every numeric column (quantities, projections, gaps ...);
+    # identifiers and text columns are dropped from the aggregate view.
+    exclude = set(group_keys) | {"ItemCode", "AgencyCode"}
+    numeric_cols = [
+        c for c in df.columns
+        if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
+    ]
+
+    agg = df.groupby(group_keys, as_index=False).agg(
+        **{c: (c, "sum") for c in numeric_cols},
+        SKU_Count=("ItemCode", "nunique"),
+        AgencyCode=("AgencyCode", "first"),
+    )
+
+    # Risk-level mix per agency (counts), if the projection carries one —
+    # the per-item classification logic itself is unchanged. A worst-case
+    # agency-level label is also derived (SHORT_STOCK if ANY item of the
+    # agency is short) purely for display badges.
+    def _worst_case(series: pd.Series) -> str:
+        vals = set(series.dropna().astype(str))
+        if "SHORT_STOCK" in vals:
+            return "SHORT_STOCK"
+        if "ENOUGH_STOCK" in vals:
+            return "ENOUGH_STOCK"
+        return sorted(vals)[0] if vals else ""
+
+    for status_col in ["Risk_Level", "M1_Stock_Status"]:
+        if status_col in df.columns:
+            counts = (
+                df.groupby(group_keys)[status_col]
+                .value_counts()
+                .unstack(fill_value=0)
+                .add_prefix(f"{status_col}_")
+                .add_suffix("_Count")
+                .reset_index()
+            )
+            agg = agg.merge(counts, on=group_keys, how="left")
+            worst = (
+                df.groupby(group_keys)[status_col]
+                .apply(_worst_case)
+                .reset_index(name=status_col)
+            )
+            agg = agg.merge(worst, on=group_keys, how="left")
+
+    # Count of short-stock items per agency-month for the UI
+    if "Risk_SHORT_STOCK_Count" not in agg.columns and "Risk_Level_SHORT_STOCK_Count" in agg.columns:
+        agg["Short_Item_Count"] = agg["Risk_Level_SHORT_STOCK_Count"]
+
+    sort_cols = [c for c in ["Agency", "Horizon"] if c in agg.columns]
+    return agg.sort_values(sort_cols).reset_index(drop=True)

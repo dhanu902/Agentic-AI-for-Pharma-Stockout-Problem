@@ -5,7 +5,11 @@ import pandas as pd
 from flask import Blueprint, jsonify
 
 from engines.risk_orchestrator import run_risk_pipeline
-from services.risk_service import RISK_LATEST_PATH
+from services.risk_service import (
+    RISK_LATEST_PATH,
+    get_risk_results_by_agency,
+    get_risk_results_with_agency,
+)
 
 risk_bp = Blueprint("risk", __name__)
 
@@ -63,9 +67,12 @@ def get_results():
             "rows":    [],
             "message": "No risk results found. Run the risk engine first.",
         }), 200
- 
+
     try:
-        df = pd.read_csv(RISK_LATEST_PATH)
+        # CHANGED: rows now carry Agency / AgencyCode / ProductName display
+        # columns (joined from the master SKU list) so the Inventory page
+        # can filter SKUs within a selected agency. Risk logic unchanged.
+        df = get_risk_results_with_agency()
  
         # Fill NaN so JSON serialisation never produces null in numeric columns
         numeric_cols = df.select_dtypes(include="number").columns.tolist()
@@ -76,9 +83,44 @@ def get_results():
         df[str_cols] = df[str_cols].fillna("")
  
         rows = [_normalize_row(r) for r in df.to_dict(orient="records")]
- 
+
         return jsonify({"rows": rows}), 200
- 
+
     except Exception as e:
         return jsonify({"rows": [], "error": str(e)}), 500
- 
+
+
+# ============================================================
+# AGENCY-WISE INVENTORY PROJECTION (business change 5)
+# Same risk rows aggregated per agency — quantities summed,
+# Risk_Level = worst case among the agency's items.
+# /results above stays item-wise for backward compatibility.
+# ============================================================
+@risk_bp.route("/results_by_agency", methods=["GET"])
+def get_results_by_agency():
+    """
+    Returns JSON matching the agency-wise Inventory.jsx expectations:
+      { rows: [ { Agency, AgencyCode, SKU_Count, Risk_Level,
+                  Forecast_Qty, ...stock buckets..., A_met, A_unmet, ... } ] }
+    """
+    try:
+        df = get_risk_results_by_agency()
+
+        if df is None or df.empty:
+            return jsonify({
+                "rows":    [],
+                "message": "No risk results found. Run the risk engine first.",
+            }), 200
+
+        numeric_cols = df.select_dtypes(include="number").columns.tolist()
+        df[numeric_cols] = df[numeric_cols].fillna(0)
+
+        str_cols = df.select_dtypes(include="object").columns.tolist()
+        df[str_cols] = df[str_cols].fillna("")
+
+        rows = [_normalize_row(r) for r in df.to_dict(orient="records")]
+
+        return jsonify({"rows": rows}), 200
+
+    except Exception as e:
+        return jsonify({"rows": [], "error": str(e)}), 500

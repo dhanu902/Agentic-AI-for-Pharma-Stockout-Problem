@@ -108,7 +108,36 @@ def get_data_file_summary() -> dict:
 # ============================================================
 # FOCUS SKU HELPERS
 # ============================================================
+def _load_master_sku_code_set() -> set:
+    """
+    ProductCodes from sku_master_full.csv (the budget-derived master SKU
+    list). Lazy import: sku_master_service imports THIS module at load
+    time, so importing it at the top here would be circular.
+    Returns an empty set when the master list is unavailable — callers
+    must treat that as "no master filter possible", not "no SKUs".
+    """
+    try:
+        from services.sku_master_service import load_sku_master_full
+        master_df = load_sku_master_full()
+        if master_df is None or master_df.empty or "ProductCode" not in master_df.columns:
+            return set()
+        return set(master_df["ProductCode"].astype(str).str.strip())
+    except Exception:
+        return set()
+
+
 def load_focus_item_codes() -> List[str]:
+    """
+    Focus item codes that go through MODEL predictions.
+
+    BUSINESS RULE (Budget is the primary focus): a focus SKU must also
+    exist in the master SKU list (sku_master_full.csv, derived from
+    Budget.xlsx). Focus codes with NO budget row are REMOVED here — no
+    budget means the SKU never reaches the master SKU sheet, so it must
+    not be forecast at all. Because every consumer (preprocess, model
+    export, dashboards) gets its focus universe from this function, the
+    intersection applies pipeline-wide.
+    """
     if not os.path.exists(FOCUS_ITEM_CODES_PATH):
         return []
 
@@ -121,7 +150,14 @@ def load_focus_item_codes() -> List[str]:
     focus_df = focus_df.dropna(subset=["Code"]).copy()
     focus_df["Code"] = focus_df["Code"].astype(int).astype(str)
 
-    return sorted(focus_df["Code"].unique().tolist())
+    codes = sorted(focus_df["Code"].unique().tolist())
+
+    # Keep only focus SKUs present in the master (budgeted) SKU list.
+    master_codes = _load_master_sku_code_set()
+    if master_codes:
+        codes = [c for c in codes if c in master_codes]
+
+    return codes
 
 
 def filter_to_focus_items(df: pd.DataFrame, focus_codes: Optional[List[str]] = None) -> pd.DataFrame:
@@ -333,8 +369,16 @@ def load_budget_item_codes() -> List[str]:
 def load_fact_history_all_skus() -> pd.DataFrame:
     """
     fact_monthly_closed for ALL SKUs (focus filter NOT applied), aggregated to
-    ItemCode x Year x Month_Number with Secondary_Sales_Qty.
+    ItemCode x Year x Month_Number with Secondary_Sales_Qty AND Primary_Sales_Qty.
     Any still-open calendar month is excluded (same rule as preprocess_engine).
+
+    Primary_Sales_Qty is carried through here (in addition to the original
+    Secondary_Sales_Qty) so consumers that need PRIMARY movement for
+    leftover/non-focus SKUs (SKUs not covered by processed_data_actual.csv,
+    which is focus-only) have one all-SKU source for BOTH sales bases,
+    instead of reading the raw file twice. If the source file doesn't have
+    a Primary_Sales_Qty column, it's filled with 0 rather than raising, so
+    existing Secondary-only callers are unaffected.
     """
     df = load_raw_data(mode="actual", apply_focus_filter=False)
 
@@ -355,6 +399,11 @@ def load_fact_history_all_skus() -> pd.DataFrame:
     if missing:
         raise ValueError(f"fact_monthly_closed missing columns: {missing}")
 
+    if "Primary_Sales_Qty" not in df.columns:
+        print("[FORECAST_SERVICE] fact_monthly_closed has no Primary_Sales_Qty column "
+              "— defaulting to 0 for all-SKU primary sales.")
+        df["Primary_Sales_Qty"] = 0
+
     df = df.copy()
     df["ItemCode"] = (
         df["ItemCode"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
@@ -365,6 +414,9 @@ def load_fact_history_all_skus() -> pd.DataFrame:
     df["Secondary_Sales_Qty"] = (
         pd.to_numeric(df["Secondary_Sales_Qty"], errors="coerce").fillna(0).clip(lower=0)
     )
+    df["Primary_Sales_Qty"] = (
+        pd.to_numeric(df["Primary_Sales_Qty"], errors="coerce").fillna(0).clip(lower=0)
+    )
 
     # Exclude any still-open calendar month
     now = datetime.utcnow()
@@ -374,7 +426,7 @@ def load_fact_history_all_skus() -> pd.DataFrame:
 
     return (
         df.groupby(["ItemCode", "Year", "Month_Number"], as_index=False)
-        ["Secondary_Sales_Qty"].sum()
+        [["Secondary_Sales_Qty", "Primary_Sales_Qty"]].sum()
         .sort_values(["ItemCode", "Year", "Month_Number"])
         .reset_index(drop=True)
     )

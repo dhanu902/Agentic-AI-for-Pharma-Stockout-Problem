@@ -1,5 +1,9 @@
 // src/pages/HorizonPage.jsx  [light theme]
 // UI v2 — visual upgrade only. All state, fetch and table logic unchanged.
+// v3 — AGENCY-WISE (business change 5): the inventory projection is now
+//      shown per AGENCY instead of per item. Same projection numbers,
+//      summed across every SKU of the agency (backend:
+//      GET /api/horizon/results_by_agency). No projection logic change.
 
 import React, { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
@@ -104,18 +108,17 @@ const tdLabelBase = {
 // Columns whose values are text/labels/dates, not numeric quantities.
 const TEXT_VALUE_KEYS = [
   "M1_Stock_Status",
-  "PO_Arrival_Date",
-  "GRN_Clearance_Date",
 ];
 
-function HorizonTable({ selectedSku, rows, loading }) {
-  const skuRows = useMemo(() => {
-    if (!selectedSku) return [];
-    return rows.filter(r => String(r.ItemCode) === String(selectedSku))
+// CHANGED (agency-wise): table shows one agency's aggregated projection.
+function HorizonTable({ selectedAgency, rows, loading }) {
+  const agencyRows = useMemo(() => {
+    if (!selectedAgency) return [];
+    return rows.filter(r => String(r.Agency) === String(selectedAgency))
       .sort((a, b) => toNumber(String(a.Horizon || "").replace("M+", "")) - toNumber(String(b.Horizon || "").replace("M+", "")));
-  }, [rows, selectedSku]);
+  }, [rows, selectedAgency]);
 
-  const monthCols = skuRows.slice(0, 6);
+  const monthCols = agencyRows.slice(0, 6);
 
   const metricRows = [
     ["Forecast Demand", "Forecast_Qty"],
@@ -124,17 +127,17 @@ function HorizonTable({ selectedSku, rows, loading }) {
     ["Total Trade Stock", "Total_Trade_Stock"],
     ["M+1 Stock Status", "M1_Stock_Status"],
     ["PO Qty", "PO_Qty"],
-    ["PO Arrival Date", "PO_Arrival_Date"],
     ["GRN Qty", "GRN_Qty"],
-    ["GRN Clearance Date", "GRN_Clearance_Date"],
     ["Projected Closing Stock", "Projected_Closing_Stock"],
+    ["SKUs Tracked", "SKU_Count"],
+    ["Short-Stock Items", "Risk_Level_SHORT_STOCK_Count"],
   ];
 
   const rowBg = (idx) => idx % 2 === 0 ? T.card : T.surface + "66";
 
   if (loading) return <div style={{ color: T.muted, fontSize: 12, padding: 16 }}>Loading horizon projection…</div>;
-  if (!selectedSku) return <div style={{ color: T.muted, fontSize: 12, padding: 16 }}>Select a SKU to view horizon projection.</div>;
-  if (monthCols.length === 0) return <div style={{ color: T.muted, fontSize: 12, padding: 16 }}>No horizon data found for SKU {selectedSku}. Run horizon engine first.</div>;
+  if (!selectedAgency) return <div style={{ color: T.muted, fontSize: 12, padding: 16 }}>Select an agency to view horizon projection.</div>;
+  if (monthCols.length === 0) return <div style={{ color: T.muted, fontSize: 12, padding: 16 }}>No horizon data found for agency {selectedAgency}. Run horizon engine first.</div>;
 
   return (
     <div className="ui-scroll" style={{ overflowX: "auto", borderRadius: 12, border: `1px solid ${T.border}` }}>
@@ -185,39 +188,40 @@ function HorizonTable({ selectedSku, rows, loading }) {
 export default function HorizonPage() {
   const [searchParams, setSearchParams] = useSearchParams();
 
-  const [sku, setSku]               = useState(searchParams.get("sku") || "");
-  const [rows, setRows]             = useState([]);
-  const [selectedSku, setSelectedSku] = useState(searchParams.get("sku") || "");
-  const [loading, setLoading]       = useState(false);
-  const [running, setRunning]       = useState(false);
-  const [error, setError]           = useState("");
+  const [agency, setAgency]               = useState(searchParams.get("agency") || "");
+  const [rows, setRows]                   = useState([]);
+  const [selectedAgency, setSelectedAgency] = useState(searchParams.get("agency") || "");
+  const [loading, setLoading]             = useState(false);
+  const [running, setRunning]             = useState(false);
+  const [error, setError]                 = useState("");
 
-  const skuOptions = useMemo(() => [...new Set(rows.map(r => String(r.ItemCode || "")))].filter(Boolean).sort(), [rows]);
+  const agencyOptions = useMemo(() => [...new Set(rows.map(r => String(r.Agency || "")))].filter(Boolean).sort(), [rows]);
 
   const selectedRows = useMemo(() => {
     return rows
-      .filter(r => String(r.ItemCode) === String(selectedSku))
+      .filter(r => String(r.Agency) === String(selectedAgency))
       .sort((a, b) =>
         toNumber(String(a.Horizon || "").replace("M+", "")) -
         toNumber(String(b.Horizon || "").replace("M+", ""))
       );
-  }, [rows, selectedSku]);
+  }, [rows, selectedAgency]);
 
   const firstMonth = selectedRows?.[0];
 
+  // CHANGED (agency-wise): /results -> /results_by_agency
   const fetchHorizonResults = async () => {
     setLoading(true); setError("");
     try {
-      const res  = await fetch(`${API_BASE}/results`);
+      const res  = await fetch(`${API_BASE}/results_by_agency`);
       const text = await res.text();
       let result = {};
-      try { result = text ? JSON.parse(text) : {}; } catch { throw new Error("Backend did not return valid JSON for /horizon/results"); }
+      try { result = text ? JSON.parse(text) : {}; } catch { throw new Error("Backend did not return valid JSON for /horizon/results_by_agency"); }
       if (!res.ok) throw new Error(result.error || "Failed to load horizon results");
       const dataRows = Array.isArray(result.rows) ? result.rows : [];
       setRows(dataRows);
-      const urlSku  = searchParams.get("sku") || "";
-      const nextSku = urlSku || selectedSku || dataRows[0]?.ItemCode || "";
-      setSelectedSku(String(nextSku)); setSku(String(nextSku));
+      const urlAgency  = searchParams.get("agency") || "";
+      const nextAgency = urlAgency || selectedAgency || dataRows[0]?.Agency || "";
+      setSelectedAgency(String(nextAgency)); setAgency(String(nextAgency));
     } catch (err) { setError(err.message || "Failed to fetch horizon results"); }
     finally { setLoading(false); }
   };
@@ -235,10 +239,10 @@ export default function HorizonPage() {
     finally { setRunning(false); }
   };
 
-  const selectSku = (code) => {
-    const clean = String(code || "").trim();
-    setSku(clean); setSelectedSku(clean);
-    if (clean) setSearchParams({ sku: clean });
+  const selectAgency = (name) => {
+    const clean = String(name || "").trim();
+    setAgency(clean); setSelectedAgency(clean);
+    if (clean) setSearchParams({ agency: clean });
   };
 
   useEffect(() => { fetchHorizonResults(); }, []);
@@ -269,15 +273,15 @@ export default function HorizonPage() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
           <div style={{ display: "flex", alignItems: "center", background: T.card, border: `1px solid ${T.borderHi}`, borderRadius: 10, boxShadow: SHADOW_SM, padding: "9px 14px", gap: 8, width: 260 }}>
-            <input list="horizon-sku-options" value={sku} onChange={e => setSku(e.target.value)}
-              onKeyDown={e => e.key === "Enter" && selectSku(sku)}
-              placeholder="Search SKU / ItemCode…"
+            <input list="horizon-agency-options" value={agency} onChange={e => setAgency(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && selectAgency(agency)}
+              placeholder="Search Agency…"
               style={{ background: "transparent", border: "none", outline: "none", color: T.text, fontSize: 13, width: "100%", fontFamily: FONT_MONO }} />
-            <datalist id="horizon-sku-options">{skuOptions.map(c => <option key={c} value={c} />)}</datalist>
+            <datalist id="horizon-agency-options">{agencyOptions.map(c => <option key={c} value={c} />)}</datalist>
           </div>
-          <button className="ui-btn" onClick={() => selectSku(sku)}
+          <button className="ui-btn" onClick={() => selectAgency(agency)}
             style={{ background: `linear-gradient(135deg, ${T.blue}, ${T.blue}D9)`, border: "none", color: "#fff", fontWeight: 800, fontSize: 13, borderRadius: 10, padding: "10px 18px", cursor: "pointer", fontFamily: FONT_UI, boxShadow: `0 8px 18px -8px ${T.blue}AA` }}>
-            Load SKU
+            Load Agency
           </button>
           <button className="ui-btn" onClick={runHorizonEngine} disabled={running}
             style={{ background: running ? T.subtle : `linear-gradient(135deg, ${T.purple}, ${T.blue})`, border: "none", color: running ? T.muted : "#fff", fontWeight: 800, fontSize: 13, borderRadius: 10, padding: "10px 18px", cursor: running ? "not-allowed" : "pointer", fontFamily: FONT_UI, boxShadow: running ? "none" : `0 8px 18px -8px ${T.purple}AA`, display: "inline-flex", alignItems: "center", gap: 8 }}>
@@ -291,20 +295,20 @@ export default function HorizonPage() {
       )}
 
       <div className="horizon-kpis">
-        <KpiCard delay={0}   title="Selected SKU" value={selectedSku || "—"} subtitle="Focused item" accent={T.blue} />
+        <KpiCard delay={0}   title="Selected Agency" value={selectedAgency || "—"} subtitle={firstMonth?.SKU_Count != null ? `${formatNum(firstMonth.SKU_Count)} SKUs tracked` : "Focused agency"} accent={T.blue} />
         <KpiCard delay={40}  title="M+1 Forecast" value={firstMonth ? formatNum(firstMonth.Forecast_Qty) : "—"} subtitle={firstMonth?.Forecast_Month || "First forecast month"} accent={T.teal} />
         <KpiCard delay={80}  title="M+1 Trade Stock" value={firstMonth ? formatNum(firstMonth.Total_Trade_Stock) : "—"} subtitle="DB + WH trade stock" accent={T.green} />
-        <KpiCard delay={120} title="M+1 Stock Status" value={firstMonth?.M1_Stock_Status || "—"} subtitle="Current simplified check" accent={firstMonth?.M1_Stock_Status === "ENOUGH_STOCK" ? T.green : T.red} />
+        <KpiCard delay={120} title="M+1 Stock Status" value={firstMonth?.M1_Stock_Status || "—"} subtitle={firstMonth?.Risk_Level_SHORT_STOCK_Count > 0 ? `${formatNum(firstMonth.Risk_Level_SHORT_STOCK_Count)} item(s) short` : "All items covered"} accent={firstMonth?.M1_Stock_Status === "ENOUGH_STOCK" ? T.green : T.red} />
       </div>
 
       <div className="ui-anim" style={{ background: T.card, border: `1px solid ${T.border}`, borderRadius: 16, padding: "18px 20px", boxShadow: SHADOW_MD, position: "relative", overflow: "hidden" }}>
         <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 3, background: `linear-gradient(90deg, ${T.purple}, ${T.purple}22 60%, transparent)` }} />
         <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 9, color: T.purple, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 4 }}>Horizon Projection</div>
+          <div style={{ fontSize: 9, color: T.purple, letterSpacing: 3, textTransform: "uppercase", fontWeight: 900, marginBottom: 4 }}>Horizon Projection — Agency Wise</div>
           <div style={{ fontSize: 15, fontWeight: 900, color: T.text }}>Forecast Horizon with M+1 Stock Status</div>
-          <div style={{ fontSize: 10.5, color: T.muted, marginTop: 3 }}>Shows M+1 to M+6 forecast demand. Current stock status is shown only for M+1 using DB + WH trade stock. PO/GRN fields are placeholders until structured supply data is available.</div>
+          <div style={{ fontSize: 10.5, color: T.muted, marginTop: 3 }}>Shows M+1 to M+6 forecast demand summed across every SKU of the agency. Stock status is the worst case among the agency's items (short if ANY item is short). PO/GRN fields are placeholders until structured supply data is available.</div>
         </div>
-        <HorizonTable selectedSku={selectedSku} rows={rows} loading={loading} />
+        <HorizonTable selectedAgency={selectedAgency} rows={rows} loading={loading} />
       </div>
     </div>
   );

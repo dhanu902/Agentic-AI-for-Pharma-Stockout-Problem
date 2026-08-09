@@ -52,7 +52,9 @@ def build_combined_forecast_table(model_df: pd.DataFrame, trend_df: pd.DataFrame
 
     # AI_MODEL wins on the rare chance a SKU appears in both — shouldn't
     # normally happen, since trend generation already excludes model SKUs.
-    source_rank = {"AI_MODEL": 0, "TREND_BASELINE": 1}
+    # BUDGET_ONLY (no standard code / no sales mapping — budget is the only
+    # number shown) ranks below both forecast sources.
+    source_rank = {"AI_MODEL": 0, "TREND_BASELINE": 1, "BUDGET_ONLY": 2}
     combined = combined.sort_values(
         by="Forecast_Source", key=lambda s: s.map(source_rank).fillna(2)
     )
@@ -151,7 +153,12 @@ def build_master_forecast_table(
         )
 
     if "Horizon_M1" in merged.columns:
-        needs_h1 = merged["Horizon_M1"].isna() & (merged["Forecast_Source"] != "NO_FORECAST")
+        # BUDGET_ONLY rows have no forecast at all — never mirror a
+        # quantity into the horizon for them (the UI shows budget only).
+        needs_h1 = (
+            merged["Horizon_M1"].isna()
+            & (~merged["Forecast_Source"].isin(["NO_FORECAST", "BUDGET_ONLY"]))
+        )
         merged.loc[needs_h1, "Horizon_M1"] = merged.loc[needs_h1, "Forecast_Qty"]
 
     merged = merged.rename(columns={"ItemCode": "ProductCode"})
